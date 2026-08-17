@@ -1,0 +1,41 @@
+# Build output
+Debug/
+Release/
+x64/
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.obj
+*.o
+*.res
+
+# Visual Studio
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+.vs/
+*.ncb
+*.opensdf
+*.sdf
+*.cachefile
+*.VC.db
+*.VC.VC.opendb
+ipch/
+
+# Build directories
+[Bb]uild/
+[Bb]uild*/
+
+# NuGet
+packages/
+*.nupkg
+
+# OS
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store

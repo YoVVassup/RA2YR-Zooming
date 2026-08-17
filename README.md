@@ -1,82 +1,81 @@
-《命令与征服：尤里的复仇》游戏内视口自由缩放插件
+# ViewCtrl — Free Zoom Plugin for C&C: Yuri's Revenge
 
 ---
 
-## 概述
+## Overview
 
-这是一款针对《尤里的复仇》（Command & Conquer: Yuri's Revenge）运行时环境的视角控制增强插件，通过运行时挂钩（runtime hooking）技术实现对游戏渲染视口（viewport）参数的动态干预，提供平滑、可自定义的视口缩放能力。
+A viewport zoom enhancement plugin for Command & Conquer: Yuri's Revenge. It uses runtime hooking to dynamically intervene in the game's rendering viewport parameters, providing smooth, customizable zoom capability.
 
-插件基于 **MinHook** 与 **Windows API** 构建，利用 **Syringe**（Ares 项目所使用的注入框架）完成注入与生命周期管理，具备良好的稳定性和兼容性。
-
----
-
-## 功能特性
-
-- 通过鼠标滚轮实现视口连续缩放
-- 缩放范围与步进精度可调
-- 不修改游戏原始可执行文件或资源
-- 对渲染管线无侵入式干预，性能开销极低
+Built on **MinHook** and the **Windows API**, with **Syringe** (the injection framework used by Ares) for injection and lifecycle management. Stable and compatible.
 
 ---
 
-## 系统要求
+## Features
 
-- 操作系统：Windows 7 及以上（x86/x64）
-- 游戏版本：《尤里的复仇》1.001
-- 运行环境：Syringe 注入框架（Ares 所依赖版本）
-
----
-
-## 安装
-
-1. 确保游戏目录已配置 Syringe 运行环境（即存在 `Syringe.exe` 或 `gamemd.exe` 已通过 Syringe 启动）
-2. 将本插件编译生成的动态库文件放置于游戏根目录
-3. 通过 Syringe 的插件加载机制启用本模块（具体方式取决于 Syringe 配置策略）
-4. 启动游戏即可生效
+- Smooth viewport zoom via mouse wheel
+- Adjustable zoom range and step precision
+- Does not modify the game executable or resources
+- Non-intrusive to the rendering pipeline, minimal performance overhead
 
 ---
 
-## 操作说明
+## Requirements
 
-| 操作 | 功能 |
-|------|------|
-| 鼠标滚轮上滚 | 拉近视口（放大） |
-| 鼠标滚轮下滚 | 拉远视口（缩小） |
-
-所有缩放参数均为编译期常量，如需调整请修改源代码并重新编译。
+- OS: Windows 7 or later (x86)
+- Game version: Yuri's Revenge 1.001
+- Runtime: Syringe injection framework (Ares dependency)
 
 ---
 
-## 兼容性
+## Installation
 
-本插件基于底层 API 挂钩实现，不依赖游戏逻辑层具体实现细节，因此理论上兼容：
-
-- 原版《尤里的复仇》1.001
-- 其他基于 Syringe 启动的修改版客户端
-
-如遇特定模组兼容性问题，请提交至 Issues 区并提供详细信息。
+1. Make sure the game directory has Syringe configured (i.e. `Syringe.exe` exists or `gamemd.exe` is launched via Syringe)
+2. Place the compiled DLL in the game root directory
+3. Enable the module via Syringe's plugin loading mechanism (depends on Syringe configuration)
+4. Launch the game
 
 ---
 
-## 技术实现
+## Controls
 
-- **挂钩库**：MinHook（提供稳定、跨平台的 x86 内联挂钩支持）
-- **系统接口**：Windows API（包括但不限于 `GetCursorPos`、`SetWindowLongPtr`、`PeekMessage` 等用于输入捕获与窗口消息处理）
-- **注入框架**：Syringe（Ares 所使用的启动时注入方案，负责 DLL 加载与初始化）
-- **渲染干预**：通过对 D3D/DDraw 相关函数或游戏内部视口计算函数实施挂钩，实现缩放参数的实时注入
+| Action | Effect |
+|--------|--------|
+| Scroll wheel up | Zoom in (magnify) |
+| Scroll wheel down | Zoom out (reduce) |
 
----
-
-## 维护与支持
-
-- 项目发起者 & 核心作者：ChoyuTsumu
-- 协助开发：Sovietianqi
-- 问题反馈：请使用 GitHub Issues
-
-欢迎提交 Pull Request 或参与讨论。
+All zoom parameters are compile-time constants. To adjust them, modify the source code and recompile.
 
 ---
 
-## 许可证
+## Compatibility
 
-本项目采用 GNU General Public License v3.0。详见 [LICENSE](LICENSE) 文件。
+This plugin hooks low-level APIs and does not depend on specific game logic implementations. It is theoretically compatible with:
+
+- Original Yuri's Revenge 1.001
+- Other Syringe-based modded clients
+
+If you encounter compatibility issues with a specific mod, please open an Issue with details.
+
+---
+
+## Technical Implementation
+
+- **Hook library**: MinHook (stable x86 inline hooking)
+- **System interfaces**: Windows API (`GetCursorPos`, `SetWindowLongPtr`, etc. for input capture and window message processing)
+- **Injection framework**: Syringe (Ares startup injection, handles DLL loading and initialization)
+- **Rendering intervention**: Hooks DirectDraw Blt and the window procedure to inject zoom parameters in real time
+
+---
+
+## Credits
+
+- Project creator & core author: ChoyuTsumu
+- Development assistant: Sovietianqi
+
+Contributions and pull requests are welcome.
+
+---
+
+## License
+
+This project is licensed under the GNU General Public License v3.0. See [LICENSE](LICENSE) for details.
