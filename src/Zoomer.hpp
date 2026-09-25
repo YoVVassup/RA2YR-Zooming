@@ -33,6 +33,10 @@ public:
 	// this is DSurface::ViewBounds, otherwise the client rect.
 	static RECT ViewRect();
 
+	// View rect used until the game reported one: DSurface::WindowBounds
+	// inside the game, an 800x600 rectangle everywhere else (unit tests).
+	static RECT DefaultViewRect();
+
 	// Point the zoom keeps fixed, in client coordinates.
 	static POINT ZoomAnchor();
 
@@ -67,8 +71,17 @@ private:
 	static inline std::atomic<float> g_zoom{ ZOOM_DEFAULT };
 	static inline std::atomic<float> g_targetZoom{ ZOOM_DEFAULT };
 	static inline std::atomic<float> g_invZoom{ 1.0f };
-	static inline std::atomic<LONG> g_centerX{ 400 };
-	static inline std::atomic<LONG> g_centerY{ 300 };
+
+	// The rectangle the render zoom magnifies. It starts out as the window the
+	// game draws into (DSurface::WindowBounds) and is replaced by
+	// DSurface::ViewBounds once the game reported one. Outside the game both
+	// fall back to the hard coded 800x600.
+	static inline RECT     g_viewRect = DefaultViewRect();
+	static inline bool     g_viewRectFromGame = false;
+
+	// The magnified view stays anchored in the center of the view rect.
+	static inline std::atomic<LONG> g_centerX{ (g_viewRect.left + g_viewRect.right) / 2 };
+	static inline std::atomic<LONG> g_centerY{ (g_viewRect.top + g_viewRect.bottom) / 2 };
 
 	// Screen point the next zoom step has to keep in place (latched per wheel
 	// event). The rendered view stays anchored at g_centerX/g_centerY.
@@ -94,11 +107,6 @@ private:
 	static inline RECT     g_clientRect = {};
 	static inline int      g_clientWidth = 0;
 	static inline int      g_clientHeight = 0;
-
-	// The rectangle the render zoom magnifies. Defaults to the client rect and
-	// is replaced by DSurface::ViewBounds while in game.
-	static inline RECT     g_viewRect = { 0, 0, 800, 600 };
-	static inline bool     g_viewRectFromGame = false;
 
 	static inline LARGE_INTEGER g_perfFrequency = {};
 	static inline LARGE_INTEGER g_lastLerpTime = {};

@@ -46,6 +46,26 @@ RECT Zoomer::ViewRect()
 	return g_viewRect;
 }
 
+RECT Zoomer::DefaultViewRect()
+{
+	// DSurface::WindowBounds: the rectangle the game draws its window into.
+	constexpr DWORD ADDR_WINDOW_BOUNDS = 0x886FB0;
+	const RECT fallback = { 0, 0, 800, 600 };
+
+	if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_WINDOW_BOUNDS), 4 * sizeof(int)))
+		return fallback;
+
+	const int left = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS);
+	const int top = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS + 4);
+	const int width = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS + 8);
+	const int height = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS + 12);
+	if (width <= 0 || height <= 0) return fallback;
+
+	const RECT rect = { left, top, left + width, top + height };
+	if (rect.left >= rect.right || rect.top >= rect.bottom) return fallback;
+	return rect;
+}
+
 POINT Zoomer::ZoomAnchor()
 {
 	POINT p = { g_centerX.load(), g_centerY.load() };
@@ -583,7 +603,9 @@ void Zoomer::Shutdown()
 	g_perfCounterReady = false;
 	g_lastLerpTime = {};
 	g_perfFrequency = {};
-	g_viewRect = { 0, 0, 800, 600 };
+	g_viewRect = DefaultViewRect();
+	g_centerX = (g_viewRect.left + g_viewRect.right) / 2;
+	g_centerY = (g_viewRect.top + g_viewRect.bottom) / 2;
 	g_viewRectFromGame = false;
 	g_useGScript = false;
 	g_pZoomFactor = nullptr;

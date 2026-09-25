@@ -28,6 +28,11 @@ public:
 	static void Init(bool zoomEnabled);
 	static void Shutdown();
 
+	// True when a game global may be dereferenced. Only inside gamemd.exe do
+	// the hard coded addresses point at the game's own data; everywhere else
+	// (unit tests, a different host exe) they are rejected.
+	static bool IsGameReadable(const void* address, size_t bytes);
+
 	// Runs before the game draws. Returns true when the frame the game is
 	// about to draw on still holds magnified pixels and it has to be told to
 	// repaint everything (emulated by writing 2 into the hooked EAX).

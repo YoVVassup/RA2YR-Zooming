@@ -56,23 +56,9 @@ namespace
 		return start + bytes <= regionEnd;
 	}
 
-	// The hard coded game globals may only be dereferenced inside gamemd.exe.
-	// Outside of the game (unit tests, a different host exe) they can point at
-	// unrelated memory, so they are rejected there before anything is read.
-	bool IsGameReadable(const void* address, size_t bytes)
-	{
-		const HMODULE game = GetModuleHandleA("gamemd.exe");
-		if (!game) return false;
-		if (!IsReadable(address, bytes)) return false;
-
-		MEMORY_BASIC_INFORMATION mbi = {};
-		if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
-		return mbi.AllocationBase == game;
-	}
-
 	void* CompositeSurface()
 	{
-		if (!IsGameReadable(reinterpret_cast<const void*>(ADDR_COMPOSITE), sizeof(void*)))
+		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_COMPOSITE), sizeof(void*)))
 			return nullptr;
 		return *reinterpret_cast<void**>(ADDR_COMPOSITE);
 	}
@@ -88,8 +74,8 @@ namespace
 
 	bool ReadGameViewRect(RECT& out)
 	{
-		if (!IsGameReadable(reinterpret_cast<const void*>(ADDR_VIEW_BOUNDS), 4 * sizeof(int))) return false;
-		if (!IsGameReadable(reinterpret_cast<const void*>(ADDR_WINDOW_BOUNDS), 4 * sizeof(int))) return false;
+		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_VIEW_BOUNDS), 4 * sizeof(int))) return false;
+		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_WINDOW_BOUNDS), 4 * sizeof(int))) return false;
 
 		int view[4] = {};
 		int window[4] = {};
@@ -167,7 +153,7 @@ namespace
 	int ClampViewDimension(bool width)
 	{
 		const DWORD address = ADDR_VIEW_BOUNDS + (width ? 2 : 3) * sizeof(int);
-		if (!IsGameReadable(reinterpret_cast<const void*>(address), sizeof(int))) return 0;
+		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(address), sizeof(int))) return 0;
 		const int gameDim = *reinterpret_cast<const int*>(address);
 
 		const float zoom = Zoomer::CurrentZoom();
@@ -187,6 +173,20 @@ namespace
 			viewW, viewH, anchor.x - view.left, anchor.y - view.top, zoom);
 		return RenderZoom::ClampDimension(gameDim, width ? src.W : src.H, true);
 	}
+}
+
+// The hard coded game globals may only be dereferenced inside gamemd.exe.
+// Outside of the game (unit tests, a different host exe) they can point at
+// unrelated memory, so they are rejected there before anything is read.
+bool RenderZoom::IsGameReadable(const void* address, size_t bytes)
+{
+	const HMODULE game = GetModuleHandleA("gamemd.exe");
+	if (!game) return false;
+	if (!IsReadable(address, bytes)) return false;
+
+	MEMORY_BASIC_INFORMATION mbi = {};
+	if (VirtualQuery(address, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+	return mbi.AllocationBase == game;
 }
 
 void RenderZoom::Init(bool zoomEnabled)

@@ -1206,3 +1206,21 @@ TEST_CASE("RenderZoom::ClampDimension") {
         CHECK(RenderZoom::ClampHeight() == 0);
     }
 }
+
+// ==================== Default view rect ====================
+
+TEST_CASE("Zoomer::DefaultViewRect") {
+    SUBCASE("outside the game the 800x600 fallback stands in") {
+        CHECK(SameRect(Zoomer::DefaultViewRect(), RECT{ 0, 0, 800, 600 }));
+    }
+
+    SUBCASE("shutdown parks the view rect on the default") {
+        TestableZoomer::ResetState();
+        TestableZoomer::SetViewRect({ 0, 0, 1752, 1248 }, true);
+
+        TestableZoomer::Shutdown();
+
+        CHECK(SameRect(TestableZoomer::ViewRect(), Zoomer::DefaultViewRect()));
+        CHECK(TestableZoomer::g_viewRectFromGame == false);
+    }
+}
