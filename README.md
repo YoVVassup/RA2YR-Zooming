@@ -36,6 +36,35 @@ Built on **MinHook** and the **Windows API**, with **Syringe** (the injection fr
 
 ---
 
+## Building
+
+`YRpp` (the Syringe headers) is a git submodule, so clone recursively:
+
+```bash
+git clone --recurse-submodules https://github.com/YoVVassup/RA2YR-Zooming.git
+```
+
+If you already have a clone, initialise the submodule once:
+
+```bash
+git submodule update --init
+```
+
+Then build `Release|Win32` (v143 toolset):
+
+```bash
+msbuild viewctrl.vcxproj /p:Configuration=Release /p:Platform=Win32
+```
+
+Tests live in `tests\test.vcxproj` and build as `Debug|Win32` only:
+
+```bash
+msbuild tests\test.vcxproj /p:Configuration=Debug /p:Platform=Win32
+tests\bin\ViewCtrlTests.exe
+```
+
+---
+
 ## Controls
 
 | Action | Effect |
