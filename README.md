@@ -4,18 +4,23 @@
 
 ## Overview
 
-A viewport zoom enhancement plugin for Command & Conquer: Yuri's Revenge. It uses runtime hooking to dynamically intervene in the game's rendering viewport parameters, providing smooth, customizable zoom capability.
+A viewport zoom enhancement plugin for Command & Conquer: Yuri's Revenge. It magnifies the tactical view at the game render level, keeps the point under the cursor fixed by driving the game camera, and un-magnifies coordinates at the places where the game turns screen positions into game space, so selection and clicks land on what is actually displayed.
 
-Built on **MinHook** and the **Windows API**, with **Syringe** (the injection framework used by Ares) for injection and lifecycle management. Stable and compatible.
+Built on the **Windows API** with **Syringe** (the injection framework used by Ares) for injection and lifecycle management. Stable and compatible.
 
 ---
 
 ## Features
 
-- Smooth viewport zoom via mouse wheel
-- Adjustable zoom range and step precision
+- Zoom the tactical view with **Ctrl + mouse wheel** (gear 1.15 per step, range 1.0x–4.0x, smooth interpolation)
+- The point under the cursor stays fixed: the game camera moves with the zoom so nothing slips away
+- **Double press Ctrl** resets the zoom to 1.0x
+- **Arrow keys** pan the magnified view
+- Render-level magnification: the view area is backed up and upscaled (nearest neighbour) over the drawn frame
+- Coordinates are transformed only where the game converts them (tactical clicks, selection rubber band, right drag), the physical cursor is never remapped
+- Optional **GScript/Ares** integration: when `GScript.ext` is loaded the zoom factor is delegated to it
 - Does not modify the game executable or resources
-- Non-intrusive to the rendering pipeline, minimal performance overhead
+- Minimal performance overhead
 
 ---
 
@@ -69,16 +74,18 @@ tests\bin\ViewCtrlTests.exe
 
 | Action | Effect |
 |--------|--------|
-| Scroll wheel up | Zoom in (magnify) |
-| Scroll wheel down | Zoom out (reduce) |
+| **Ctrl + scroll wheel up** | Zoom in (magnify) |
+| **Ctrl + scroll wheel down** | Zoom out (reduce) |
+| **Double press Ctrl** (within 400 ms) | Reset the zoom to 1.0x |
+| **Arrow keys** (while zoomed) | Pan the magnified view |
 
-All zoom parameters are compile-time constants. To adjust them, modify the source code and recompile.
+All zoom parameters are compile-time constants (`src\Zoomer.hpp`). To adjust them, modify the source code and recompile.
 
 ---
 
 ## Compatibility
 
-This plugin hooks low-level APIs and does not depend on specific game logic implementations. It is theoretically compatible with:
+This plugin hooks the game's own render and input flow through Syringe and does not rewrite the executable on disk. It is theoretically compatible with:
 
 - Original Yuri's Revenge 1.001
 - Other Syringe-based modded clients
@@ -89,10 +96,11 @@ If you encounter compatibility issues with a specific mod, please open an Issue 
 
 ## Technical Implementation
 
-- **Hook library**: MinHook (stable x86 inline hooking)
-- **System interfaces**: Windows API (`GetCursorPos`, `SetWindowLongPtr`, etc. for input capture and window message processing)
-- **Injection framework**: Syringe (Ares startup injection, handles DLL loading and initialization)
-- **Rendering intervention**: Hooks DirectDraw Blt and the window procedure to inject zoom parameters in real time
+- **Injection framework**: Syringe (`DEFINE_HOOK` code hooks; Ares startup injection, handles DLL loading and initialization)
+- **Input**: subclasses the game window procedure (`SetWindowLongPtrW`) for the wheel and hotkey handling; the cursor position itself is never remapped
+- **Rendering**: hooks the frame pre/post render points, backs up the view rows and upscales the source rect (nearest neighbour) over the drawn frame; viewport width/height reads are clamped to the magnified source rect
+- **Camera**: moves the game camera on every zoom step so the focused point stays under the cursor; undo on reset
+- **Coordinate transforms**: tactical click, selection rubber band start/end and right drag speed are un-magnified at the exact game locations that convert screen space to game space (same four spots Telescope uses)
 
 ---
 

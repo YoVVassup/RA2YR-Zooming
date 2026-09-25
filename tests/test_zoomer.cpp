@@ -12,16 +12,13 @@
 #include "../src/Log.h"
 #include "mock_window.h"
 
-static BOOL WINAPI MockGetCursorPos(LPPOINT lpPoint)
-{
-    if (!lpPoint) return FALSE;
-    lpPoint->x = 500;
-    lpPoint->y = 500;
-    return TRUE;
-}
+static UINT   g_recordedMsg = 0;
+static LPARAM g_recordedLParam = 0;
 
 static LRESULT CALLBACK MockWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+    g_recordedMsg = msg;
+    g_recordedLParam = lParam;
     return DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
@@ -54,7 +51,6 @@ public:
         g_initialized = false;
         g_wndProcHooked = false;
         OriginalWndProc = (WNDPROC)MockWndProc;
-        OriginalGetCursorPos = (void*)MockGetCursorPos;
         g_perfCounterReady = false;
         g_lastLerpTime = {};
         g_perfFrequency = {};
@@ -63,6 +59,8 @@ public:
         g_ctrlHeld = false;
         g_haveLastPress = false;
         g_lastPressMs = 0;
+        g_recordedMsg = 0;
+        g_recordedLParam = 0;
         if (g_hThread) { CloseHandle(g_hThread); g_hThread = nullptr; }
         RenderZoom::ResetFrameState();
         RenderZoom::SetEnabled(false);
@@ -81,7 +79,6 @@ public:
     using Zoomer::CtrlHeld;
     using Zoomer::ApplyWheelSteps;
     using Zoomer::RegisterDoublePress;
-    using Zoomer::HookedGetCursorPos;
     using Zoomer::NewWndProc;
     using Zoomer::Shutdown;
 };
@@ -267,52 +264,129 @@ TEST_CASE("UpdateClientCache") {
     }
 }
 
-// ==================== HookedGetCursorPos ====================
+// ==================== UnMagnify ====================
 
-TEST_CASE("HookedGetCursorPos") {
+TEST_CASE("UnMagnify") {
     TestableZoomer::ResetState();
 
-    MockWindow win;
-    REQUIRE(win.Create());
-    TestableZoomer::g_hWnd = win.hWnd;
-    TestableZoomer::UpdateClientCache(win.hWnd);
-
-    SUBCASE("null lpPoint") {
-        BOOL result = TestableZoomer::HookedGetCursorPos(nullptr);
-        CHECK(result == FALSE);
+    SUBCASE("zoom 1.0 - rejected") {
+        POINT in = { 100, 100 };
+        POINT out = { -1, -1 };
+        CHECK(TestableZoomer::UnMagnify(in, out) == false);
     }
 
-    SUBCASE("zoom 1.0x - no remap") {
-        TestableZoomer::g_zoom.store(1.0f);
-        POINT pt = { 500, 500 };
-        BOOL result = TestableZoomer::HookedGetCursorPos(&pt);
-        CHECK(result == TRUE);
-        CHECK(pt.x == 500);
-        CHECK(pt.y == 500);
+    SUBCASE("inside the snap epsilon - rejected") {
+        TestableZoomer::g_zoom.store(1.0005f);
+
+        POINT in = { 100, 100 };
+        POINT out = { -1, -1 };
+        CHECK(TestableZoomer::UnMagnify(in, out) == false);
     }
 
-    SUBCASE("zoomed in - the point under the cursor is remapped") {
+    SUBCASE("the center point stays put at 2.0x") {
         TestableZoomer::g_zoom.store(2.0f);
-        TestableZoomer::g_invZoom.store(0.5f);
 
-        POINT client = { 500, 500 };
-        ScreenToClient(win.hWnd, &client);
-        REQUIRE(TestableZoomer::IsPointInMapArea(client));
+        POINT in = { 400, 300 };
+        POINT out = { -1, -1 };
+        REQUIRE(TestableZoomer::UnMagnify(in, out));
+        CHECK(out.x == 400);
+        CHECK(out.y == 300);
+    }
 
-        int expectedX = TestableZoomer::g_centerX.load()
-            + lroundf((client.x - TestableZoomer::g_centerX.load()) * 0.5f);
-        int expectedY = TestableZoomer::g_centerY.load()
-            + lroundf((client.y - TestableZoomer::g_centerY.load()) * 0.5f);
-        POINT expected = { expectedX, expectedY };
-        TestableZoomer::ClampToViewport(&expected);
-        ClientToScreen(win.hWnd, &expected);
+    SUBCASE("the view origin maps to the source origin") {
+        TestableZoomer::g_zoom.store(2.0f);
 
-        POINT pt = { 500, 500 };
-        CHECK(TestableZoomer::HookedGetCursorPos(&pt) == TRUE);
-        CHECK(pt.x == expected.x);
-        CHECK(pt.y == expected.y);
-        const bool unmoved = (pt.x == 500 && pt.y == 500);
-        CHECK_FALSE(unmoved);
+        // 800x600 at 2.0x shows the centered source rect (200,150,400,300)
+        POINT in = { 0, 0 };
+        POINT out = { -1, -1 };
+        REQUIRE(TestableZoomer::UnMagnify(in, out));
+        CHECK(out.x == 200);
+        CHECK(out.y == 150);
+    }
+
+    SUBCASE("the far corner stays inside the view") {
+        TestableZoomer::g_zoom.store(2.0f);
+
+        POINT in = { 799, 599 };
+        POINT out = { -1, -1 };
+        REQUIRE(TestableZoomer::UnMagnify(in, out));
+        CHECK(out.x == 600);
+        CHECK(out.y == 450);
+        CHECK(out.x >= 0);
+        CHECK(out.x < 800);
+        CHECK(out.y >= 0);
+        CHECK(out.y < 600);
+    }
+
+    SUBCASE("half up rounding") {
+        TestableZoomer::g_zoom.store(2.0f);
+
+        POINT in = { 1, 1 };
+        POINT out = { -1, -1 };
+        REQUIRE(TestableZoomer::UnMagnify(in, out));
+        CHECK(out.x == 201);
+        CHECK(out.y == 151);
+    }
+
+    SUBCASE("points outside the view rect are rejected") {
+        TestableZoomer::g_zoom.store(2.0f);
+
+        POINT right = { 800, 300 };
+        POINT left = { -1, 10 };
+        POINT bottom = { 400, 600 };
+        POINT out = { -1, -1 };
+        CHECK(TestableZoomer::UnMagnify(right, out) == false);
+        CHECK(TestableZoomer::UnMagnify(left, out) == false);
+        CHECK(TestableZoomer::UnMagnify(bottom, out) == false);
+    }
+
+    SUBCASE("an offset view origin behaves like the plain one") {
+        TestableZoomer::SetViewRect({ 100, 50, 900, 650 }, true);
+        TestableZoomer::g_zoom.store(2.0f);
+
+        POINT in = { 0, 0 };
+        POINT out = { -1, -1 };
+        REQUIRE(TestableZoomer::UnMagnify(in, out));
+        CHECK(out.x == 200);
+        CHECK(out.y == 150);
+    }
+
+    SUBCASE("a degenerate view rect is rejected") {
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_viewRect = { 100, 100, 100, 100 };
+
+        POINT in = { 0, 0 };
+        POINT out = { -1, -1 };
+        CHECK(TestableZoomer::UnMagnify(in, out) == false);
+    }
+}
+
+// ==================== ContentScale ====================
+
+TEST_CASE("ContentScale") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("zoom 1.0 - inactive") {
+        float sx = 0.0f, sy = 0.0f;
+        CHECK(TestableZoomer::ContentScale(sx, sy) == false);
+    }
+
+    SUBCASE("a centered 2.0x view moves content at half speed") {
+        TestableZoomer::g_zoom.store(2.0f);
+
+        float sx = 0.0f, sy = 0.0f;
+        REQUIRE(TestableZoomer::ContentScale(sx, sy));
+        CHECK(sx == doctest::Approx(0.5f));
+        CHECK(sy == doctest::Approx(0.5f));
+    }
+
+    SUBCASE("a centered 4.0x view moves content at quarter speed") {
+        TestableZoomer::g_zoom.store(4.0f);
+
+        float sx = 0.0f, sy = 0.0f;
+        REQUIRE(TestableZoomer::ContentScale(sx, sy));
+        CHECK(sx == doctest::Approx(0.25f));
+        CHECK(sy == doctest::Approx(0.25f));
     }
 }
 
@@ -431,17 +505,18 @@ TEST_CASE("NewWndProc") {
         CHECK(TestableZoomer::g_centerX.load() == prevX + stepX);
     }
 
-    SUBCASE("WM_MOUSEMOVE with zoom - remaps coords") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-        TestableZoomer::g_invZoom.store(1.0f / 1.5f);
-        TestableZoomer::g_centerX = 400;
-        TestableZoomer::g_centerY = 300;
+    SUBCASE("mouse messages pass through untouched even when zoomed") {
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_targetZoom.store(2.0f);
+        TestableZoomer::g_invZoom.store(0.5f);
+        g_recordedMsg = 0;
+        g_recordedLParam = 0;
 
         LPARAM lParam = MAKELPARAM(500, 400);
-        LRESULT result = TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEMOVE, 0, lParam);
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEMOVE, 0, lParam);
 
-        CHECK(result == 0);
+        CHECK(g_recordedMsg == WM_MOUSEMOVE);
+        CHECK(g_recordedLParam == lParam);
     }
 
     SUBCASE("non-zoom message passes through") {
@@ -451,9 +526,9 @@ TEST_CASE("NewWndProc") {
     }
 }
 
-// ==================== Double Alt reset ====================
+// ==================== Double Ctrl reset ====================
 
-TEST_CASE("Double Alt reset") {
+TEST_CASE("Double Ctrl reset") {
     TestableZoomer::ResetState();
 
     MockWindow win;
@@ -461,36 +536,58 @@ TEST_CASE("Double Alt reset") {
     TestableZoomer::g_hWnd = win.hWnd;
     TestableZoomer::UpdateClientCache(win.hWnd);
 
-    SUBCASE("single Alt - does not reset zoom") {
+    SUBCASE("single Ctrl - does not reset zoom") {
         TestableZoomer::g_zoom.store(1.5f);
         TestableZoomer::g_targetZoom.store(1.8f);
 
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_CONTROL, 0);
 
         CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
         CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.8f));
     }
 
-    SUBCASE("Alt with the key repeat bit - ignored") {
+    SUBCASE("Ctrl with the key repeat bit - ignored") {
         TestableZoomer::g_zoom.store(1.5f);
         TestableZoomer::g_targetZoom.store(1.8f);
 
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0x40000000);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_CONTROL, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_CONTROL, 0x40000000);
 
         CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
         CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.8f));
     }
 
-    SUBCASE("double Alt - resets the zoom") {
+    SUBCASE("double Ctrl - resets the zoom") {
         TestableZoomer::g_zoom.store(2.5f);
         TestableZoomer::g_targetZoom.store(2.8f);
 
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_CONTROL, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_CONTROL, 0);
 
         CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(ZOOM_DEFAULT));
         CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(ZOOM_DEFAULT));
+    }
+
+    SUBCASE("system key messages do not reset - telescope watches WM_KEYDOWN") {
+        TestableZoomer::g_zoom.store(2.5f);
+        TestableZoomer::g_targetZoom.store(2.8f);
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_SYSKEYDOWN, VK_CONTROL, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_SYSKEYDOWN, VK_CONTROL, 0);
+
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(2.5f));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(2.8f));
+    }
+
+    SUBCASE("double Ctrl also drops the focus latch") {
+        TestableZoomer::g_zoom.store(2.5f);
+        TestableZoomer::g_targetZoom.store(2.8f);
+        TestableZoomer::g_focusValid = true;
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_CONTROL, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_CONTROL, 0);
+
+        CHECK(TestableZoomer::g_focusValid == false);
     }
 
     SUBCASE("double press window") {
@@ -779,62 +876,6 @@ TEST_CASE("Shutdown") {
         TestableZoomer::Shutdown();
         TestableZoomer::Shutdown();
         CHECK(TestableZoomer::g_initialized == false);
-    }
-}
-
-// ==================== Mouse coordinate remapping ====================
-
-TEST_CASE("Mouse coordinate remapping") {
-    TestableZoomer::ResetState();
-    TestableZoomer::g_centerX = 960;
-    TestableZoomer::g_centerY = 540;
-
-    SUBCASE("zoom 1.5x - remap coordinates") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_invZoom.store(1.0f / 1.5f);
-
-        int clientX = 1000;
-        int clientY = 600;
-
-        int originalX = TestableZoomer::g_centerX.load() +
-            lroundf((clientX - TestableZoomer::g_centerX.load()) * TestableZoomer::g_invZoom);
-        int originalY = TestableZoomer::g_centerY.load() +
-            lroundf((clientY - TestableZoomer::g_centerY.load()) * TestableZoomer::g_invZoom);
-
-        CHECK(originalX == 987);
-        CHECK(originalY == 580);
-    }
-
-    SUBCASE("zoom 2.0x - remap coordinates") {
-        TestableZoomer::g_zoom.store(2.0f);
-        TestableZoomer::g_invZoom.store(0.5f);
-
-        int clientX = 1200;
-        int clientY = 740;
-
-        int originalX = TestableZoomer::g_centerX.load() +
-            lroundf((clientX - TestableZoomer::g_centerX.load()) * TestableZoomer::g_invZoom);
-        int originalY = TestableZoomer::g_centerY.load() +
-            lroundf((clientY - TestableZoomer::g_centerY.load()) * TestableZoomer::g_invZoom);
-
-        CHECK(originalX == 1080);
-        CHECK(originalY == 640);
-    }
-
-    SUBCASE("point at the anchor - unchanged") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_invZoom.store(1.0f / 1.5f);
-
-        int clientX = 960;
-        int clientY = 540;
-
-        int originalX = TestableZoomer::g_centerX.load() +
-            lroundf((clientX - TestableZoomer::g_centerX.load()) * TestableZoomer::g_invZoom);
-        int originalY = TestableZoomer::g_centerY.load() +
-            lroundf((clientY - TestableZoomer::g_centerY.load()) * TestableZoomer::g_invZoom);
-
-        CHECK(originalX == 960);
-        CHECK(originalY == 540);
     }
 }
 

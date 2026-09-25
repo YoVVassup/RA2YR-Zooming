@@ -4,11 +4,6 @@
 #include "Log.h"
 #include <windowsx.h>
 #include <psapi.h>
-#ifndef VIEWCTRL_TEST
-#include <MinHook.h>
-#endif
-
-typedef BOOL(WINAPI* GetCursorPosFunc)(LPPOINT lpPoint);
 
 void Zoomer::UpdateClientCache(HWND hWnd)
 {
@@ -80,6 +75,70 @@ float Zoomer::CurrentZoom()
 bool Zoomer::UsingGScript()
 {
 	return g_useGScript;
+}
+
+bool Zoomer::ZoomActive()
+{
+	return fabsf(g_zoom.load() - ZOOM_DEFAULT) > ZOOM_SNAP;
+}
+
+bool Zoomer::ContentScale(float& scaleX, float& scaleY)
+{
+	if (!ZoomActive()) return false;
+
+	const RECT view = g_viewRect;
+	const int viewW = view.right - view.left;
+	const int viewH = view.bottom - view.top;
+	if (viewW <= 0 || viewH <= 0) return false;
+
+	const POINT anchor = ZoomAnchor();
+	const RenderZoom::SourceRect src = RenderZoom::ComputeSourceRect(
+		viewW, viewH, anchor.x - view.left, anchor.y - view.top, g_zoom.load());
+	if (src.W <= 0 || src.H <= 0) return false;
+
+	scaleX = (float)src.W / (float)viewW;
+	scaleY = (float)src.H / (float)viewH;
+	return true;
+}
+
+bool Zoomer::UnMagnify(const POINT& in, POINT& out)
+{
+	// Telescopes coordinate transforms are gated behind an active zoom
+	// (its FUN_1003d5e0 active test).
+	if (!ZoomActive()) return false;
+
+	const RECT view = g_viewRect;
+	const int viewW = view.right - view.left;
+	const int viewH = view.bottom - view.top;
+	if (viewW <= 0 || viewH <= 0) return false;
+
+	// The game hands over view relative coordinates: telescope turns them
+	// into absolute ones first and bounds them against the viewport.
+	if (in.x < 0 || in.x >= viewW || in.y < 0 || in.y >= viewH) return false;
+
+	const POINT anchor = ZoomAnchor();
+	const RenderZoom::SourceRect src = RenderZoom::ComputeSourceRect(
+		viewW, viewH, anchor.x - view.left, anchor.y - view.top, g_zoom.load());
+	if (src.W <= 0 || src.H <= 0) return false;
+
+	// Inverse of what RenderZoom::Upscale draws: the displayed view relative
+	// point picks its pixel from the source rect (telescope FUN_1003be70).
+	float mappedX = (float)src.X + (float)in.x * (float)src.W / (float)viewW;
+	float mappedY = (float)src.Y + (float)in.y * (float)src.H / (float)viewH;
+
+	if (mappedX < 0.0f) mappedX = 0.0f;
+	if (mappedX > (float)(viewW - 1)) mappedX = (float)(viewW - 1);
+	if (mappedY < 0.0f) mappedY = 0.0f;
+	if (mappedY > (float)(viewH - 1)) mappedY = (float)(viewH - 1);
+
+	out.x = (int)floorf(mappedX + 0.5f);
+	out.y = (int)floorf(mappedY + 0.5f);
+
+	if (out.x < 0) out.x = 0;
+	if (out.y < 0) out.y = 0;
+	if (out.x > viewW - 1) out.x = viewW - 1;
+	if (out.y > viewH - 1) out.y = viewH - 1;
+	return true;
 }
 
 void Zoomer::TickFrame()
@@ -326,31 +385,6 @@ bool Zoomer::RegisterDoublePress(DWORD nowMs)
 	return false;
 }
 
-BOOL WINAPI Zoomer::HookedGetCursorPos(LPPOINT lpPoint)
-{
-	if (!OriginalGetCursorPos || !lpPoint)
-		return FALSE;
-
-	BOOL result = ((GetCursorPosFunc)OriginalGetCursorPos)(lpPoint);
-
-	if (g_zoom != ZOOM_DEFAULT && g_hWnd)
-	{
-		POINT clientPt = *lpPoint;
-		ScreenToClient(g_hWnd, &clientPt);
-
-		if (IsPointInMapArea(clientPt))
-		{
-			clientPt.x = g_centerX + lroundf((clientPt.x - g_centerX) * g_invZoom.load());
-			clientPt.y = g_centerY + lroundf((clientPt.y - g_centerY) * g_invZoom.load());
-			ClampToViewport(&clientPt);
-			ClientToScreen(g_hWnd, &clientPt);
-			*lpPoint = clientPt;
-		}
-	}
-
-	return result;
-}
-
 LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	if (msg == WM_MOUSEWHEEL)
@@ -402,16 +436,17 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 		return CallWindowProc(OriginalWndProc, hWnd, msg, wParam, lParam);
 	}
 
+	// Double press Ctrl resets the zoom: telescope listens for the same
+	// WM_KEYDOWN of VK_CONTROL, ignoring the auto repeat bit. Ctrl itself is
+	// never consumed.
+	if (msg == WM_KEYDOWN && wParam == VK_CONTROL && !(lParam & 0x40000000))
+	{
+		if (RegisterDoublePress(GetTickCount()))
+			ResetZoom();
+	}
+
 	if (msg == WM_KEYDOWN)
 	{
-		// Double Alt press within DOUBLE_PRESS_MS resets the zoom; Alt itself
-		// is not consumed, the game still receives it.
-		if (wParam == VK_MENU && !(lParam & 0x40000000))
-		{
-			if (RegisterDoublePress(GetTickCount()))
-				ResetZoom();
-		}
-
 		if (g_zoom.load() != ZOOM_DEFAULT && !CtrlHeld())
 		{
 			const int viewW = g_viewRect.right - g_viewRect.left;
@@ -448,34 +483,10 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 		UpdateClientCache(hWnd);
 	}
 
-	if (g_zoom != ZOOM_DEFAULT)
-	{
-		switch (msg)
-		{
-		case WM_MOUSEMOVE:
-		case WM_LBUTTONDOWN:
-		case WM_LBUTTONUP:
-		case WM_RBUTTONDOWN:
-		case WM_RBUTTONUP:
-		case WM_MBUTTONDOWN:
-		case WM_MBUTTONUP:
-		case WM_LBUTTONDBLCLK:
-		case WM_RBUTTONDBLCLK:
-		{
-			POINT clientPt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
-
-			// Only the magnified view remaps, the sidebar still takes raw
-			// client coordinates.
-			if (PtInRect(&g_viewRect, clientPt))
-			{
-				int originalX = g_centerX + lroundf((clientPt.x - g_centerX) * g_invZoom.load());
-				int originalY = g_centerY + lroundf((clientPt.y - g_centerY) * g_invZoom.load());
-				lParam = MAKELPARAM(originalX, originalY);
-			}
-		}
-		break;
-		}
-	}
+	// Mouse messages pass through untouched: the game consumes the physical
+	// position and the coordinate transforms happen at the points where it
+	// turns a screen position into game space (see Main.cpp), exactly like
+	// Telescope does instead of remapping the message stream.
 	return CallWindowProc(OriginalWndProc, hWnd, msg, wParam, lParam);
 }
 
@@ -517,26 +528,6 @@ DWORD WINAPI Zoomer::InitThread(LPVOID lpParam)
 	g_wndProcHooked = (OriginalWndProc != nullptr);
 	LOG("WndProc hook: %s (orig=%p)", g_wndProcHooked ? "OK" : "FAILED", OriginalWndProc);
 
-	bool mhOk = false;
-#ifndef VIEWCTRL_TEST
-	MH_STATUS mhStatus = MH_Initialize();
-	LOG("MH_Initialize: %s (%d)", MH_StatusToString(mhStatus), mhStatus);
-
-	if (mhOk = (mhStatus == MH_OK))
-	{
-		MH_STATUS createStatus = MH_CreateHookApi(
-			L"user32.dll",
-			"GetCursorPos",
-			HookedGetCursorPos,
-			(void**)&OriginalGetCursorPos
-		);
-		LOG("MH_CreateHookApi GetCursorPos: %s (%d)", MH_StatusToString(createStatus), createStatus);
-
-		MH_STATUS enableStatus = MH_EnableHook(MH_ALL_HOOKS);
-		LOG("MH_EnableHook: %s (%d)", MH_StatusToString(enableStatus), enableStatus);
-	}
-#endif
-
 	HMODULE hGScript = GetModuleHandleA("GScript.ext");
 	if (!hGScript) hGScript = GetModuleHandleA("GScript.dll");
 	if (hGScript)
@@ -577,7 +568,7 @@ DWORD WINAPI Zoomer::InitThread(LPVOID lpParam)
 	RenderZoom::Init(!g_useGScript);
 
 	ShowCursor(FALSE);
-	g_initialized = mhOk || g_wndProcHooked;
+	g_initialized = g_wndProcHooked;
 	LOG("Init complete: g_initialized=%d useGScript=%d", g_initialized, g_useGScript);
 
 	return 0;
@@ -616,11 +607,6 @@ void Zoomer::Shutdown()
 
 	if (g_initialized)
 	{
-		LOG("Disabling MinHook hooks");
-#ifndef VIEWCTRL_TEST
-		MH_DisableHook(MH_ALL_HOOKS);
-		MH_Uninitialize();
-#endif
 		ShowCursor(TRUE);
 	}
 
@@ -628,7 +614,6 @@ void Zoomer::Shutdown()
 	g_zoom.store(ZOOM_DEFAULT);
 	g_targetZoom.store(ZOOM_DEFAULT);
 	g_invZoom.store(1.0f);
-	OriginalGetCursorPos = nullptr;
 	g_initialized = false;
 	g_perfCounterReady = false;
 	g_lastLerpTime = {};

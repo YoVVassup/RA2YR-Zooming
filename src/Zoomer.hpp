@@ -48,6 +48,21 @@ public:
 	// True when another extension (Ares' GScript zoom) owns the zoom factor.
 	static bool UsingGScript();
 
+	// True while the view is magnified (zoom differs from 1.0 beyond the
+	// snap epsilon). Telescope gates its coordinate transforms the same way.
+	static bool ZoomActive();
+
+	// Maps a view relative point the game computed from the physical cursor
+	// onto the source rect that is actually displayed there. Returns false
+	// when the zoom is inactive or the point lies outside the view rect.
+	// Port of Telescope's FUN_1003d1b0/FUN_1003be70 pair: it is the inverse
+	// of what RenderZoom::Upscale draws, so out is view relative too.
+	static bool UnMagnify(const POINT& in, POINT& out);
+
+	// Scale between a screen delta and the content it moves (source rect over
+	// view rect = 1/zoom while the anchor sits in the view center).
+	static bool ContentScale(float& scaleX, float& scaleY);
+
 #ifdef VIEWCTRL_TEST
 public:
 #else
@@ -65,7 +80,9 @@ private:
 	static void ResetZoom();
 
 	// True while Ctrl is physically held (tests inject the state instead of
-	// pressing real keys).
+	// pressing real keys). Ctrl doubles as the wheel modifier and, when
+	// pressed twice within DOUBLE_PRESS_MS, as the reset key - the same
+	// combination Telescope uses.
 	static bool CtrlHeld();
 
 	// Wheel zoom: multiplies the factor by ZOOM_GEAR per scroll step in the
@@ -76,7 +93,6 @@ private:
 	// double press within DOUBLE_PRESS_MS of the previous one.
 	static bool RegisterDoublePress(DWORD nowMs);
 
-	static BOOL WINAPI HookedGetCursorPos(LPPOINT lpPoint);
 	static LRESULT CALLBACK NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 	static DWORD WINAPI InitThread(LPVOID lpParam);
 
@@ -110,7 +126,7 @@ private:
 	// GameCamera::ShiftBy() cannot start another zoom step.
 	static inline bool     g_cameraBusy = false;
 
-	// Double press bookkeeping for the Alt-resets-the-zoom hotkey.
+	// Double press bookkeeping for the Ctrl-resets-the-zoom hotkey.
 	static inline DWORD    g_lastPressMs = 0;
 	static inline bool     g_haveLastPress = false;
 
@@ -120,7 +136,6 @@ private:
 #endif
 
 	static inline WNDPROC  OriginalWndProc = nullptr;
-	static inline void*    OriginalGetCursorPos = nullptr;
 
 	static inline HANDLE   g_hThread = nullptr;
 	static inline bool     g_initialized = false;
