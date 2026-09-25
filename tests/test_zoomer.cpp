@@ -1,43 +1,16 @@
+#ifndef VIEWCTRL_TEST
 #define VIEWCTRL_TEST
+#endif
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include "doctest.h"
 #include <vector>
+#include <cstring>
 
 #include "../src/Zoomer.hpp"
+#include "../src/RenderZoom.hpp"
 #include "../src/GameCamera.hpp"
 #include "../src/Log.h"
-#include "mock_ddraw.h"
 #include "mock_window.h"
-
-static HRESULT WINAPI MockBlt(
-    LPDIRECTDRAWSURFACE7 self,
-    LPRECT destRect,
-    LPDIRECTDRAWSURFACE7 srcSurface,
-    LPRECT srcRect,
-    DWORD flags,
-    LPDDBLTFX fx)
-{
-    return DD_OK;
-}
-
-static HRESULT WINAPI MockFlip(
-    LPDIRECTDRAWSURFACE7 self,
-    LPDIRECTDRAWSURFACE7 target,
-    DWORD flags)
-{
-    return DD_OK;
-}
-
-static HRESULT WINAPI MockBltFast(
-    LPDIRECTDRAWSURFACE7 self,
-    DWORD x,
-    DWORD y,
-    LPDIRECTDRAWSURFACE7 srcSurface,
-    LPRECT srcRect,
-    DWORD flags)
-{
-    return DD_OK;
-}
 
 static BOOL WINAPI MockGetCursorPos(LPPOINT lpPoint)
 {
@@ -47,35 +20,15 @@ static BOOL WINAPI MockGetCursorPos(LPPOINT lpPoint)
     return TRUE;
 }
 
-static HRESULT WINAPI MockLock(
-    IDirectDrawSurface7* self,
-    LPRECT lpDestRect,
-    LPDDSURFACEDESC2 lpDDSurfaceDesc,
-    DWORD dwFlags,
-    HANDLE hEvent)
-{
-    if (lpDDSurfaceDesc) {
-        lpDDSurfaceDesc->lpSurface = (void*)0x12345678;
-        lpDDSurfaceDesc->lPitch = 7680;
-        lpDDSurfaceDesc->dwWidth = 1920;
-        lpDDSurfaceDesc->dwHeight = 1080;
-    }
-    return DD_OK;
-}
-
-static HRESULT WINAPI MockUnlock(IDirectDrawSurface7* self, LPRECT lpRect)
-{
-    return DD_OK;
-}
-
-static BOOL WINAPI MockSwapBuffers(HDC hdc)
-{
-    return TRUE;
-}
-
 static LRESULT CALLBACK MockWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     return DefWindowProcW(hWnd, msg, wParam, lParam);
+}
+
+static bool SameRect(const RECT& a, const RECT& b)
+{
+    return a.left == b.left && a.top == b.top
+        && a.right == b.right && a.bottom == b.bottom;
 }
 
 class TestableZoomer : public Zoomer {
@@ -96,41 +49,25 @@ public:
         g_clientRect = { 0, 0, 1920, 1080 };
         g_clientWidth = 1920;
         g_clientHeight = 1080;
-        g_mapRight = g_clientWidth - SIDEBAR_WIDTH;
-        g_mapBottom = g_clientHeight - BOTTOM_BAR_HEIGHT + GUARD_LINES;
-        g_destDetected = true;
-        g_knownPrimaryOrBack.clear();
+        g_viewRect = { 0, 0, 800, 600 };
+        g_viewRectFromGame = false;
         g_initialized = false;
         g_wndProcHooked = false;
         OriginalWndProc = (WNDPROC)MockWndProc;
-        OriginalBlt = (void*)MockBlt;
-        OriginalFlip = (void*)MockFlip;
-        OriginalBltFast = (void*)MockBltFast;
         OriginalGetCursorPos = (void*)MockGetCursorPos;
-        OriginalBitBlt = nullptr;
-        OriginalStretchBlt = nullptr;
-        OriginalSwapBuffers = nullptr;
-        g_surfaceStates.clear();
-        g_vtable = nullptr;
         g_perfCounterReady = false;
         g_lastLerpTime = {};
         g_perfFrequency = {};
-        g_hMonitor = nullptr;
-        g_monitorRect = {};
-        g_monitorWidth = 0;
-        g_monitorHeight = 0;
-        g_ddrawWrapper = DDrawWrapper::Unknown;
+        g_useGScript = false;
+        g_pZoomFactor = nullptr;
         if (g_hThread) { CloseHandle(g_hThread); g_hThread = nullptr; }
+        RenderZoom::ResetFrameState();
+        RenderZoom::SetEnabled(false);
     }
 
-    using Zoomer::IsMapArea;
     using Zoomer::IsPointInMapArea;
-    using Zoomer::ApplyZoomToRect;
-    using Zoomer::IsPrimaryOrBackBuffer;
     using Zoomer::ClampToViewport;
-    using Zoomer::g_surfaceStates;
     using Zoomer::UpdateClientCache;
-    using Zoomer::UpdateCenter;
     using Zoomer::UpdateLerp;
     using Zoomer::UpdateLerpFrameIndependent;
     using Zoomer::CommitZoom;
@@ -138,104 +75,48 @@ public:
     using Zoomer::UndoCameraOffset;
     using Zoomer::PanCamera;
     using Zoomer::ResetZoom;
-    using Zoomer::DetectDDrawWrapper;
-    using Zoomer::UpdateMonitorInfo;
-    using Zoomer::HookedBlt;
-    using Zoomer::HookedFlip;
-    using Zoomer::HookedBltFast;
     using Zoomer::HookedGetCursorPos;
-    using Zoomer::HookedBitBlt;
-    using Zoomer::HookedStretchBlt;
-    using Zoomer::HookedSwapBuffers;
-    using Zoomer::HookedPresent;
     using Zoomer::NewWndProc;
     using Zoomer::Shutdown;
 };
-
-// ==================== IsMapArea ====================
-
-TEST_CASE("IsMapArea") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("exact map rect (0,0,mapRight,mapBottom)") {
-        RECT r = { 0, 0, 1752, 1248 };
-        CHECK(TestableZoomer::IsMapArea(&r) == true);
-    }
-
-    SUBCASE("non-zero left") {
-        RECT r = { 1, 0, 1752, 1248 };
-        CHECK(TestableZoomer::IsMapArea(&r) == false);
-    }
-
-    SUBCASE("non-zero top") {
-        RECT r = { 0, 1, 1752, 1248 };
-        CHECK(TestableZoomer::IsMapArea(&r) == false);
-    }
-
-    SUBCASE("wrong right") {
-        RECT r = { 0, 0, 1920, 1248 };
-        CHECK(TestableZoomer::IsMapArea(&r) == false);
-    }
-
-    SUBCASE("wrong bottom") {
-        RECT r = { 0, 0, 1752, 1080 };
-        CHECK(TestableZoomer::IsMapArea(&r) == false);
-    }
-
-    SUBCASE("smaller rect inside map") {
-        RECT r = { 100, 100, 400, 400 };
-        CHECK(TestableZoomer::IsMapArea(&r) == false);
-    }
-
-    SUBCASE("null rect") {
-        CHECK(TestableZoomer::IsMapArea(nullptr) == false);
-    }
-
-    SUBCASE("null hWnd") {
-        TestableZoomer::g_hWnd = nullptr;
-        RECT r = { 0, 0, 1752, 1048 };
-        CHECK(TestableZoomer::IsMapArea(&r) == false);
-    }
-
-    SUBCASE("zero-size rect at origin") {
-        RECT r = { 0, 0, 0, 0 };
-        CHECK(TestableZoomer::IsMapArea(&r) == false);
-    }
-}
 
 // ==================== IsPointInMapArea ====================
 
 TEST_CASE("IsPointInMapArea") {
     TestableZoomer::ResetState();
 
-    SUBCASE("point inside map") {
+    SUBCASE("point inside the view rect") {
         POINT pt = { 500, 500 };
         CHECK(TestableZoomer::IsPointInMapArea(pt) == true);
     }
 
-    SUBCASE("point at origin") {
+    SUBCASE("origin is inside") {
         POINT pt = { 0, 0 };
         CHECK(TestableZoomer::IsPointInMapArea(pt) == true);
     }
 
-    SUBCASE("point outside right") {
-        POINT pt = { 1800, 500 };
+    SUBCASE("right edge belongs to the next area") {
+        POINT pt = { 800, 500 };
         CHECK(TestableZoomer::IsPointInMapArea(pt) == false);
     }
 
-    SUBCASE("point outside bottom") {
-        POINT pt = { 500, 1300 };
+    SUBCASE("bottom edge belongs to the next area") {
+        POINT pt = { 500, 600 };
         CHECK(TestableZoomer::IsPointInMapArea(pt) == false);
     }
 
-    SUBCASE("point at map boundary right -1") {
-        POINT pt = { TestableZoomer::g_mapRight - 1, 500 };
-        CHECK(TestableZoomer::IsPointInMapArea(pt) == true);
+    SUBCASE("point left of the view rect") {
+        POINT pt = { -1, 100 };
+        CHECK(TestableZoomer::IsPointInMapArea(pt) == false);
     }
 
-    SUBCASE("point at map boundary right") {
-        POINT pt = { TestableZoomer::g_mapRight, 500 };
-        CHECK(TestableZoomer::IsPointInMapArea(pt) == false);
+    SUBCASE("the tactical view rect decides, not the window") {
+        TestableZoomer::SetViewRect({ 0, 0, 1752, 1248 }, true);
+
+        POINT inside = { 1751, 1247 };
+        POINT inSidebar = { 1800, 500 };
+        CHECK(TestableZoomer::IsPointInMapArea(inside) == true);
+        CHECK(TestableZoomer::IsPointInMapArea(inSidebar) == false);
     }
 
     SUBCASE("null hWnd") {
@@ -245,113 +126,97 @@ TEST_CASE("IsPointInMapArea") {
     }
 }
 
-// ==================== ApplyZoomToRect ====================
-
-TEST_CASE("ApplyZoomToRect") {
-    TestableZoomer::ResetState();
-    TestableZoomer::g_centerX = 400;
-    TestableZoomer::g_centerY = 300;
-
-    SUBCASE("zoom 1.0x - no change") {
-        TestableZoomer::g_zoom.store(1.0f);
-        RECT r = { 100, 100, 500, 400 };
-        TestableZoomer::ApplyZoomToRect(&r);
-        CHECK(r.left == 100);
-        CHECK(r.top == 100);
-        CHECK(r.right == 500);
-        CHECK(r.bottom == 400);
-    }
-
-    SUBCASE("zoom 2.0x - doubled from center") {
-        TestableZoomer::g_zoom.store(2.0f);
-        RECT r = { 300, 200, 500, 400 };
-        TestableZoomer::ApplyZoomToRect(&r);
-        CHECK(r.left == 200);
-        CHECK(r.top == 100);
-        CHECK(r.right == 600);
-        CHECK(r.bottom == 500);
-    }
-
-    SUBCASE("zoom 1.5x") {
-        TestableZoomer::g_zoom.store(1.5f);
-        RECT r = { 200, 100, 600, 500 };
-        TestableZoomer::ApplyZoomToRect(&r);
-        CHECK(r.left == 100);
-        CHECK(r.top == 0);
-        CHECK(r.right == 700);
-        CHECK(r.bottom == 600);
-    }
-
-    SUBCASE("rect centered on zoom center - unchanged") {
-        TestableZoomer::g_zoom.store(1.5f);
-        RECT r = { 400, 300, 400, 300 };
-        TestableZoomer::ApplyZoomToRect(&r);
-        CHECK(r.left == 400);
-        CHECK(r.top == 300);
-        CHECK(r.right == 400);
-        CHECK(r.bottom == 300);
-    }
-
-    SUBCASE("null rect") {
-        TestableZoomer::ApplyZoomToRect(nullptr);
-    }
-}
-
 // ==================== ClampToViewport ====================
 
 TEST_CASE("ClampToViewport") {
     TestableZoomer::ResetState();
 
-    SUBCASE("point inside viewport") {
+    SUBCASE("point inside the view rect") {
         POINT pt = { 500, 500 };
         TestableZoomer::ClampToViewport(&pt);
         CHECK(pt.x == 500);
         CHECK(pt.y == 500);
     }
 
-    SUBCASE("point left of viewport") {
+    SUBCASE("point left of the view rect") {
         POINT pt = { -100, 500 };
         TestableZoomer::ClampToViewport(&pt);
         CHECK(pt.x == 0);
     }
 
-    SUBCASE("point right of viewport") {
+    SUBCASE("point right of the view rect") {
         POINT pt = { 2000, 500 };
         TestableZoomer::ClampToViewport(&pt);
-        CHECK(pt.x == TestableZoomer::g_mapRight);
+        CHECK(pt.x == 800);
     }
 
-    SUBCASE("point above viewport") {
+    SUBCASE("point above the view rect") {
         POINT pt = { 500, -100 };
         TestableZoomer::ClampToViewport(&pt);
         CHECK(pt.y == 0);
     }
 
-    SUBCASE("point below viewport") {
+    SUBCASE("point below the view rect") {
         POINT pt = { 500, 2000 };
         TestableZoomer::ClampToViewport(&pt);
-        CHECK(pt.y == TestableZoomer::g_mapBottom);
+        CHECK(pt.y == 600);
+    }
+
+    SUBCASE("view rect with an offset origin") {
+        TestableZoomer::SetViewRect({ 100, 50, 900, 650 }, true);
+
+        POINT before = { -50, 10 };
+        TestableZoomer::ClampToViewport(&before);
+        CHECK(before.x == 100);
+        CHECK(before.y == 50);
+
+        POINT after = { 1000, 1000 };
+        TestableZoomer::ClampToViewport(&after);
+        CHECK(after.x == 900);
+        CHECK(after.y == 650);
     }
 
     SUBCASE("null point") {
         TestableZoomer::ClampToViewport(nullptr);
     }
+}
 
-    SUBCASE("null hWnd") {
-        TestableZoomer::g_hWnd = nullptr;
-        POINT pt = { 500, 500 };
-        TestableZoomer::ClampToViewport(&pt);
-        CHECK(pt.x == 500);
-        CHECK(pt.y == 500);
+// ==================== SetViewRect ====================
+
+TEST_CASE("SetViewRect") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("an inverted rect is ignored") {
+        RECT bad = { 100, 100, 100, 200 };
+        TestableZoomer::SetViewRect(bad, false);
+
+        CHECK(SameRect(TestableZoomer::ViewRect(), RECT{ 0, 0, 800, 600 }));
+        CHECK(TestableZoomer::g_viewRectFromGame == false);
     }
 
-    SUBCASE("zero mapRight/mapBottom - no clamp") {
-        TestableZoomer::g_mapRight = 0;
-        TestableZoomer::g_mapBottom = 0;
-        POINT pt = { 500, 500 };
-        TestableZoomer::ClampToViewport(&pt);
-        CHECK(pt.x == 500);
-        CHECK(pt.y == 500);
+    SUBCASE("a new rect moves the zoom anchor to its center") {
+        TestableZoomer::SetViewRect({ 0, 0, 1752, 1248 }, true);
+
+        CHECK(SameRect(TestableZoomer::ViewRect(), RECT{ 0, 0, 1752, 1248 }));
+        CHECK(TestableZoomer::ZoomAnchor().x == 876);
+        CHECK(TestableZoomer::ZoomAnchor().y == 624);
+    }
+
+    SUBCASE("an unchanged rect keeps the anchor") {
+        TestableZoomer::g_centerX = 123;
+        TestableZoomer::g_centerY = 456;
+        TestableZoomer::SetViewRect({ 0, 0, 800, 600 }, false);
+
+        CHECK(TestableZoomer::ZoomAnchor().x == 123);
+        CHECK(TestableZoomer::ZoomAnchor().y == 456);
+    }
+
+    SUBCASE("only the game marks the rect as its own") {
+        TestableZoomer::SetViewRect({ 0, 0, 700, 500 }, false);
+        CHECK(TestableZoomer::g_viewRectFromGame == false);
+
+        TestableZoomer::SetViewRect({ 0, 0, 700, 500 }, true);
+        CHECK(TestableZoomer::g_viewRectFromGame == true);
     }
 }
 
@@ -361,327 +226,38 @@ TEST_CASE("UpdateClientCache") {
     TestableZoomer::ResetState();
 
     SUBCASE("null hWnd does not crash") {
-        int prevWidth = TestableZoomer::g_clientWidth;
+        RECT prev = TestableZoomer::ViewRect();
         TestableZoomer::UpdateClientCache(nullptr);
-        CHECK(TestableZoomer::g_clientWidth == prevWidth);
+        CHECK(SameRect(TestableZoomer::ViewRect(), prev));
     }
 
-    SUBCASE("valid hWnd updates dimensions") {
+    SUBCASE("valid hWnd updates the dimensions") {
         HWND hWnd = GetDesktopWindow();
         TestableZoomer::UpdateClientCache(hWnd);
         CHECK(TestableZoomer::g_clientWidth > 0);
         CHECK(TestableZoomer::g_clientHeight > 0);
     }
-}
 
-// ==================== UpdateCenter ====================
+    SUBCASE("the window rect becomes the view rect") {
+        MockWindow win;
+        REQUIRE(win.Create());
 
-TEST_CASE("UpdateCenter") {
-    TestableZoomer::ResetState();
+        TestableZoomer::UpdateClientCache(win.hWnd);
 
-    SUBCASE("null hWnd does not crash") {
-        int prevX = TestableZoomer::g_centerX.load();
-        int prevY = TestableZoomer::g_centerY.load();
-        TestableZoomer::UpdateCenter(nullptr);
-        CHECK(TestableZoomer::g_centerX.load() == prevX);
-        CHECK(TestableZoomer::g_centerY.load() == prevY);
+        CHECK(SameRect(TestableZoomer::ViewRect(), TestableZoomer::g_clientRect));
+        CHECK(TestableZoomer::ZoomAnchor().x == TestableZoomer::g_clientRect.right / 2);
+        CHECK(TestableZoomer::ZoomAnchor().y == TestableZoomer::g_clientRect.bottom / 2);
     }
 
-    SUBCASE("center from clientRect 1920x1080") {
-        TestableZoomer::g_clientRect = { 0, 0, 1920, 1080 };
-        TestableZoomer::UpdateCenter((HWND)0xDEAD);
-        CHECK(TestableZoomer::g_centerX.load() == 960);
-        CHECK(TestableZoomer::g_centerY.load() == 540);
-    }
-
-    SUBCASE("center from clientRect 800x600") {
-        TestableZoomer::g_clientRect = { 0, 0, 800, 600 };
-        TestableZoomer::UpdateCenter((HWND)0xDEAD);
-        CHECK(TestableZoomer::g_centerX.load() == 400);
-        CHECK(TestableZoomer::g_centerY.load() == 300);
-    }
-
-    SUBCASE("center from offset clientRect") {
-        TestableZoomer::g_clientRect = { 100, 50, 900, 650 };
-        TestableZoomer::UpdateCenter((HWND)0xDEAD);
-        CHECK(TestableZoomer::g_centerX.load() == 500);
-        CHECK(TestableZoomer::g_centerY.load() == 350);
-    }
-}
-
-// ==================== IsPrimaryOrBackBuffer ====================
-
-TEST_CASE("IsPrimaryOrBackBuffer") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("null surface") {
-        CHECK(TestableZoomer::IsPrimaryOrBackBuffer(nullptr) == false);
-    }
-
-    SUBCASE("primary surface") {
-        MockSurface mock;
-        mock.SetAsPrimary();
-        CHECK(TestableZoomer::IsPrimaryOrBackBuffer(&mock) == true);
-    }
-
-    SUBCASE("back buffer surface") {
-        MockSurface mock;
-        mock.SetAsBackBuffer();
-        CHECK(TestableZoomer::IsPrimaryOrBackBuffer(&mock) == true);
-    }
-
-    SUBCASE("offscreen surface") {
-        MockSurface mock;
-        CHECK(TestableZoomer::IsPrimaryOrBackBuffer(&mock) == false);
-    }
-
-    SUBCASE("cached on second call") {
-        MockSurface mock;
-        mock.SetAsPrimary();
-        CHECK(TestableZoomer::IsPrimaryOrBackBuffer(&mock) == true);
-        CHECK(TestableZoomer::IsPrimaryOrBackBuffer(&mock) == true);
-        CHECK(TestableZoomer::g_knownPrimaryOrBack.count(&mock) == 1);
-    }
-
-    SUBCASE("GetSurfaceDesc fails") {
-        MockSurface mock;
-        mock.getSurfaceDescFail = true;
-        CHECK(TestableZoomer::IsPrimaryOrBackBuffer(&mock) == false);
-    }
-}
-
-// ==================== HookedBlt ====================
-
-TEST_CASE("HookedBlt") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("zoom 1.0x - passes through unchanged") {
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.0f);
-
-        MockSurface self;
-        MockSurface src;
-
-        RECT dest = { 100, 100, 500, 400 };
-        RECT srcRect = { 0, 0, 400, 300 };
-
-        HRESULT hr = TestableZoomer::HookedBlt(
-            &self, &dest, &src, &srcRect, DDBLT_WAIT, nullptr);
-        CHECK(hr == DD_OK);
-        CHECK(dest.left == 100);
-        CHECK(dest.right == 500);
-    }
-
-    SUBCASE("non-primary surface - passes through") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        MockSurface src;
-
-        RECT dest = { 100, 100, 500, 400 };
-
-        HRESULT hr = TestableZoomer::HookedBlt(
-            &self, &dest, &src, nullptr, DDBLT_WAIT, nullptr);
-        CHECK(hr == DD_OK);
-        CHECK(dest.left == 100);
-    }
-
-    SUBCASE("primary surface with zoom - applies zoom") {
-        TestableZoomer::g_zoom.store(2.0f);
-        TestableZoomer::g_targetZoom.store(2.0f);
-        TestableZoomer::g_centerX = 400;
-        TestableZoomer::g_centerY = 300;
-
-        MockSurface self;
-        self.SetAsPrimary();
-        MockSurface src;
-
-        RECT dest = { 0, 0, 1752, 1248 };
-
-        HRESULT hr = TestableZoomer::HookedBlt(
-            &self, &dest, &src, nullptr, DDBLT_WAIT, nullptr);
-        CHECK(hr == DD_OK);
-    }
-
-    SUBCASE("lerp updates g_zoom") {
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        MockSurface src;
-
-        RECT dest = { 100, 100, 500, 400 };
-
-        TestableZoomer::HookedBlt(&self, &dest, &src, nullptr, DDBLT_WAIT, nullptr);
-
-        float newZoom = TestableZoomer::g_zoom.load();
-        CHECK(newZoom > 1.0f);
-        CHECK(newZoom < 1.5f);
-    }
-
-    SUBCASE("snap when close to target") {
-        TestableZoomer::g_zoom.store(1.4995f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        MockSurface src;
-
-        RECT dest = { 100, 100, 500, 400 };
-
-        TestableZoomer::HookedBlt(&self, &dest, &src, nullptr, DDBLT_WAIT, nullptr);
-
-        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
-    }
-
-    SUBCASE("dest outside map area - not zoomed") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        self.SetAsPrimary();
-        MockSurface src;
-
-        RECT dest = { 1800, 1300, 1900, 1400 };
-
-        HRESULT hr = TestableZoomer::HookedBlt(
-            &self, &dest, &src, nullptr, DDBLT_WAIT, nullptr);
-        CHECK(hr == DD_OK);
-        CHECK(dest.left == 1800);
-    }
-}
-
-// ==================== HookedFlip ====================
-
-TEST_CASE("HookedFlip") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("zoom 1.0x - passes through unchanged") {
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.0f);
-
-        MockSurface self;
-        HRESULT hr = TestableZoomer::HookedFlip(&self, nullptr, DDFLIP_WAIT);
-        CHECK(hr == DD_OK);
-    }
-
-    SUBCASE("non-primary surface - passes through") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        HRESULT hr = TestableZoomer::HookedFlip(&self, nullptr, DDFLIP_WAIT);
-        CHECK(hr == DD_OK);
-    }
-
-    SUBCASE("primary surface with zoom - applies zoom via Blt") {
-        TestableZoomer::g_zoom.store(2.0f);
-        TestableZoomer::g_targetZoom.store(2.0f);
-        TestableZoomer::g_centerX = 400;
-        TestableZoomer::g_centerY = 300;
-
-        MockSurface self;
-        self.SetAsPrimary();
-
-        HRESULT hr = TestableZoomer::HookedFlip(&self, nullptr, DDFLIP_WAIT);
-        CHECK(hr == DD_OK);
-    }
-
-    SUBCASE("lerp updates g_zoom via UpdateLerp") {
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-
-        TestableZoomer::HookedFlip(&self, nullptr, DDFLIP_WAIT);
-
-        float newZoom = TestableZoomer::g_zoom.load();
-        CHECK(newZoom > 1.0f);
-        CHECK(newZoom < 1.5f);
-    }
-
-    SUBCASE("null OriginalFlip - returns DD_OK") {
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.0f);
-        TestableZoomer::OriginalFlip = nullptr;
-
-        MockSurface self;
-        HRESULT hr = TestableZoomer::HookedFlip(&self, nullptr, DDFLIP_WAIT);
-        CHECK(hr == DD_OK);
-
-        TestableZoomer::OriginalFlip = (void*)MockFlip;
-    }
-}
-
-// ==================== HookedBltFast ====================
-
-TEST_CASE("HookedBltFast") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("zoom 1.0x - passes through unchanged") {
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.0f);
-
-        MockSurface self;
-        MockSurface src;
-        RECT srcRect = { 0, 0, 100, 100 };
-
-        HRESULT hr = TestableZoomer::HookedBltFast(&self, 50, 50, &src, &srcRect, DDBLTFAST_WAIT);
-        CHECK(hr == DD_OK);
-    }
-
-    SUBCASE("non-primary surface - passes through") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        MockSurface src;
-        RECT srcRect = { 0, 0, 100, 100 };
-
-        HRESULT hr = TestableZoomer::HookedBltFast(&self, 50, 50, &src, &srcRect, DDBLTFAST_WAIT);
-        CHECK(hr == DD_OK);
-    }
-
-    SUBCASE("primary surface with zoom - applies zoom") {
-        TestableZoomer::g_zoom.store(2.0f);
-        TestableZoomer::g_targetZoom.store(2.0f);
-        TestableZoomer::g_centerX = 400;
-        TestableZoomer::g_centerY = 300;
-
-        MockSurface self;
-        self.SetAsPrimary();
-        MockSurface src;
-        RECT srcRect = { 0, 0, 100, 100 };
-
-        HRESULT hr = TestableZoomer::HookedBltFast(&self, 50, 50, &src, &srcRect, DDBLTFAST_WAIT);
-        CHECK(hr == DD_OK);
-    }
-
-    SUBCASE("lerp updates g_zoom") {
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        MockSurface src;
-        RECT srcRect = { 0, 0, 100, 100 };
-
-        TestableZoomer::HookedBltFast(&self, 50, 50, &src, &srcRect, DDBLTFAST_WAIT);
-
-        float newZoom = TestableZoomer::g_zoom.load();
-        CHECK(newZoom > 1.0f);
-        CHECK(newZoom < 1.5f);
-    }
-
-    SUBCASE("null srcRect - passes through") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        MockSurface self;
-        self.SetAsPrimary();
-        MockSurface src;
-
-        HRESULT hr = TestableZoomer::HookedBltFast(&self, 50, 50, &src, nullptr, DDBLTFAST_WAIT);
-        CHECK(hr == DD_OK);
+    SUBCASE("a game view rect survives a window refresh") {
+        MockWindow win;
+        REQUIRE(win.Create());
+
+        TestableZoomer::SetViewRect({ 0, 0, 1752, 1248 }, true);
+        TestableZoomer::UpdateClientCache(win.hWnd);
+
+        CHECK(SameRect(TestableZoomer::ViewRect(), RECT{ 0, 0, 1752, 1248 }));
+        CHECK(TestableZoomer::g_viewRectFromGame == true);
     }
 }
 
@@ -693,6 +269,7 @@ TEST_CASE("HookedGetCursorPos") {
     MockWindow win;
     REQUIRE(win.Create());
     TestableZoomer::g_hWnd = win.hWnd;
+    TestableZoomer::UpdateClientCache(win.hWnd);
 
     SUBCASE("null lpPoint") {
         BOOL result = TestableZoomer::HookedGetCursorPos(nullptr);
@@ -704,6 +281,32 @@ TEST_CASE("HookedGetCursorPos") {
         POINT pt = { 500, 500 };
         BOOL result = TestableZoomer::HookedGetCursorPos(&pt);
         CHECK(result == TRUE);
+        CHECK(pt.x == 500);
+        CHECK(pt.y == 500);
+    }
+
+    SUBCASE("zoomed in - the point under the cursor is remapped") {
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_invZoom.store(0.5f);
+
+        POINT client = { 500, 500 };
+        ScreenToClient(win.hWnd, &client);
+        REQUIRE(TestableZoomer::IsPointInMapArea(client));
+
+        int expectedX = TestableZoomer::g_centerX.load()
+            + lroundf((client.x - TestableZoomer::g_centerX.load()) * 0.5f);
+        int expectedY = TestableZoomer::g_centerY.load()
+            + lroundf((client.y - TestableZoomer::g_centerY.load()) * 0.5f);
+        POINT expected = { expectedX, expectedY };
+        TestableZoomer::ClampToViewport(&expected);
+        ClientToScreen(win.hWnd, &expected);
+
+        POINT pt = { 500, 500 };
+        CHECK(TestableZoomer::HookedGetCursorPos(&pt) == TRUE);
+        CHECK(pt.x == expected.x);
+        CHECK(pt.y == expected.y);
+        const bool unmoved = (pt.x == 500 && pt.y == 500);
+        CHECK_FALSE(unmoved);
     }
 }
 
@@ -716,67 +319,48 @@ TEST_CASE("NewWndProc") {
     REQUIRE(win.Create());
     TestableZoomer::g_hWnd = win.hWnd;
     TestableZoomer::UpdateClientCache(win.hWnd);
-    TestableZoomer::UpdateCenter(win.hWnd);
 
     SUBCASE("WM_MOUSEWHEEL zoom in") {
         TestableZoomer::g_targetZoom.store(1.0f);
-        short delta = 120;
-        WPARAM wParam = MAKEWPARAM(0, delta);
         LPARAM lParam = MAKELPARAM(400, 300);
 
-        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, wParam, lParam);
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120), lParam);
 
-        float target = TestableZoomer::g_targetZoom.load();
-        CHECK(target > 1.0f);
-        CHECK(target == doctest::Approx(1.05f));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.05f));
     }
 
     SUBCASE("WM_MOUSEWHEEL zoom out") {
         TestableZoomer::g_targetZoom.store(1.5f);
-        short delta = -120;
-        WPARAM wParam = MAKEWPARAM(0, delta);
         LPARAM lParam = MAKELPARAM(400, 300);
 
-        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, wParam, lParam);
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -120), lParam);
 
-        float target = TestableZoomer::g_targetZoom.load();
-        CHECK(target == doctest::Approx(1.45f));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.45f));
     }
 
     SUBCASE("WM_MOUSEWHEEL clamps to MAX") {
-        TestableZoomer::g_targetZoom.store(1.95f);
-        short delta = 120;
-        WPARAM wParam = MAKEWPARAM(0, delta);
-        LPARAM lParam = MAKELPARAM(400, 300);
-
-        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, wParam, lParam);
-
+        TestableZoomer::g_targetZoom.store(3.95f);
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
+                                   MAKELPARAM(400, 300));
         CHECK(TestableZoomer::g_targetZoom.load() <= ZOOM_MAX);
     }
 
     SUBCASE("WM_MOUSEWHEEL clamps to MIN") {
         TestableZoomer::g_targetZoom.store(1.0f);
-        short delta = -120;
-        WPARAM wParam = MAKEWPARAM(0, delta);
-        LPARAM lParam = MAKELPARAM(400, 300);
-
-        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, wParam, lParam);
-
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -120),
+                                   MAKELPARAM(400, 300));
         CHECK(TestableZoomer::g_targetZoom.load() >= ZOOM_MIN);
     }
 
-    SUBCASE("WM_MOUSEWHEEL outside map area - ignored") {
+    SUBCASE("WM_MOUSEWHEEL outside the view rect - ignored") {
         TestableZoomer::g_targetZoom.store(1.0f);
-        short delta = 120;
-        WPARAM wParam = MAKEWPARAM(0, delta);
-        LPARAM lParam = MAKELPARAM(1900, 1300);
-
-        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, wParam, lParam);
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
+                                   MAKELPARAM(1900, 1300));
 
         CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.0f));
     }
 
-    SUBCASE("WM_MOUSEWHEEL latches focus instead of moving the crop center") {
+    SUBCASE("WM_MOUSEWHEEL latches the focus instead of moving the anchor") {
         TestableZoomer::g_focusValid = false;
         TestableZoomer::g_targetZoom.store(1.0f);
         const LONG prevCenterX = TestableZoomer::g_centerX.load();
@@ -797,10 +381,30 @@ TEST_CASE("NewWndProc") {
         CHECK(TestableZoomer::g_targetZoom.load() > 1.0f);
     }
 
-    SUBCASE("WM_SIZE updates cache") {
-        int prevWidth = TestableZoomer::g_clientWidth;
+    SUBCASE("WM_SIZE refreshes the view rect") {
+        TestableZoomer::g_clientWidth = 0;
+        TestableZoomer::g_clientHeight = 0;
+
         TestableZoomer::NewWndProc(win.hWnd, WM_SIZE, 0, 0);
+
         CHECK(TestableZoomer::g_clientWidth > 0);
+        CHECK(TestableZoomer::g_clientHeight > 0);
+        CHECK(SameRect(TestableZoomer::ViewRect(), TestableZoomer::g_clientRect));
+    }
+
+    SUBCASE("arrow keys pan the magnified view") {
+        if (GetKeyState(VK_CONTROL) & 0x8000) return;
+
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_targetZoom.store(2.0f);
+        const LONG prevX = TestableZoomer::g_centerX.load();
+        const RECT view = TestableZoomer::ViewRect();
+        const int stepX = (int)((float)(view.right - view.left) / 2.0f * 0.2f);
+
+        LRESULT result = TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_RIGHT, 0);
+
+        CHECK(result == 0);
+        CHECK(TestableZoomer::g_centerX.load() == prevX + stepX);
     }
 
     SUBCASE("WM_MOUSEMOVE with zoom - remaps coords") {
@@ -823,72 +427,37 @@ TEST_CASE("NewWndProc") {
     }
 }
 
-// ==================== Shutdown ====================
+// ==================== Ctrl+0 hotkey ====================
 
-TEST_CASE("Shutdown") {
+TEST_CASE("Ctrl+0 hotkey") {
     TestableZoomer::ResetState();
 
-    SUBCASE("resets all state") {
+    MockWindow win;
+    REQUIRE(win.Create());
+    TestableZoomer::g_hWnd = win.hWnd;
+    TestableZoomer::UpdateClientCache(win.hWnd);
+
+    SUBCASE("0 without Ctrl - does not reset zoom") {
         TestableZoomer::g_zoom.store(1.5f);
         TestableZoomer::g_targetZoom.store(1.8f);
-        TestableZoomer::g_invZoom.store(0.666f);
-        TestableZoomer::g_initialized = true;
-        TestableZoomer::g_knownPrimaryOrBack.insert((IDirectDrawSurface7*)0xDEAD);
 
-        TestableZoomer::Shutdown();
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_0, 0);
 
-        CHECK(TestableZoomer::g_zoom.load() == ZOOM_DEFAULT);
-        CHECK(TestableZoomer::g_targetZoom.load() == ZOOM_DEFAULT);
-        CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
-        CHECK(TestableZoomer::g_initialized == false);
-        CHECK(TestableZoomer::g_knownPrimaryOrBack.empty());
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.8f));
     }
 
-    SUBCASE("restores vtable if set") {
-        MockSurface mock;
-        TestableZoomer::g_vtable = *reinterpret_cast<void***>(&mock);
-        TestableZoomer::OriginalBlt = (void*)0xBEEF;
-        TestableZoomer::OriginalFlip = (void*)0xFACE;
-        TestableZoomer::OriginalBltFast = (void*)0xCAFE;
+    SUBCASE("non-VK_0 key - does not reset zoom") {
+        TestableZoomer::g_zoom.store(1.5f);
+        TestableZoomer::g_targetZoom.store(1.8f);
 
-        TestableZoomer::Shutdown();
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, 0x41, 0);
 
-        CHECK(TestableZoomer::g_vtable == nullptr);
-        CHECK(TestableZoomer::OriginalBlt == nullptr);
-        CHECK(TestableZoomer::OriginalFlip == nullptr);
-        CHECK(TestableZoomer::OriginalBltFast == nullptr);
-    }
-
-    SUBCASE("restores WndProc if hooked") {
-        TestableZoomer::g_wndProcHooked = true;
-        TestableZoomer::OriginalWndProc = (WNDPROC)0xCAFE;
-
-        TestableZoomer::Shutdown();
-
-        CHECK(TestableZoomer::g_wndProcHooked == false);
-        CHECK(TestableZoomer::OriginalWndProc == nullptr);
-    }
-
-    SUBCASE("resets map detection") {
-        TestableZoomer::g_mapRight = 1752;
-        TestableZoomer::g_mapBottom = 1248;
-        TestableZoomer::g_destDetected = true;
-
-        TestableZoomer::Shutdown();
-
-        CHECK(TestableZoomer::g_mapRight == 0);
-        CHECK(TestableZoomer::g_mapBottom == 0);
-        CHECK(TestableZoomer::g_destDetected == false);
-    }
-
-    SUBCASE("multiple calls are safe") {
-        TestableZoomer::Shutdown();
-        TestableZoomer::Shutdown();
-        CHECK(TestableZoomer::g_initialized == false);
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
     }
 }
 
-// ==================== Zoom lerp logic ====================
+// ==================== Zoom lerp ====================
 
 TEST_CASE("Zoom lerp") {
     TestableZoomer::ResetState();
@@ -897,102 +466,274 @@ TEST_CASE("Zoom lerp") {
         TestableZoomer::g_zoom.store(1.0f);
         TestableZoomer::g_targetZoom.store(1.5f);
 
+        TestableZoomer::UpdateLerp();
+
         float cur = TestableZoomer::g_zoom.load();
-        float tgt = TestableZoomer::g_targetZoom.load();
-        float diff = tgt - cur;
-
-        CHECK(diff == doctest::Approx(0.5f));
-
-        cur += diff * ZOOM_LERP;
-        CHECK(cur == doctest::Approx(1.075f));
+        CHECK(cur == doctest::Approx(1.0f + 0.5f * ZOOM_LERP));
+        CHECK(TestableZoomer::g_invZoom.load() == doctest::Approx(1.0f / cur));
     }
 
     SUBCASE("snap when close enough") {
         TestableZoomer::g_zoom.store(1.4995f);
         TestableZoomer::g_targetZoom.store(1.5f);
 
-        float cur = TestableZoomer::g_zoom.load();
-        float tgt = TestableZoomer::g_targetZoom.load();
-        float diff = tgt - cur;
+        TestableZoomer::UpdateLerp();
 
-        CHECK(fabsf(diff) < ZOOM_SNAP);
-        cur = tgt;
-        CHECK(cur == doctest::Approx(1.5f));
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
     }
 
     SUBCASE("multiple lerp steps converge") {
-        float cur = 1.0f;
-        float tgt = 1.5f;
+        TestableZoomer::g_zoom.store(1.0f);
+        TestableZoomer::g_targetZoom.store(1.5f);
+
         int steps = 0;
-
-        while (fabsf(tgt - cur) >= ZOOM_SNAP && steps < 100) {
-            cur += (tgt - cur) * ZOOM_LERP;
-            steps++;
+        while (fabsf(TestableZoomer::g_targetZoom.load() - TestableZoomer::g_zoom.load()) >= ZOOM_SNAP
+               && steps < 100) {
+            TestableZoomer::UpdateLerp();
+            ++steps;
         }
+        // one more step, it is the one that snaps onto the target
+        TestableZoomer::UpdateLerp();
 
-        CHECK(cur == doctest::Approx(tgt).epsilon(0.01));
         CHECK(steps > 0);
         CHECK(steps < 100);
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
     }
 
     SUBCASE("lerp down") {
-        float cur = 2.0f;
-        float tgt = 1.0f;
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_targetZoom.store(1.0f);
 
-        for (int i = 0; i < 50; i++) {
-            float diff = tgt - cur;
-            if (fabsf(diff) < ZOOM_SNAP) { cur = tgt; break; }
-            cur += diff * ZOOM_LERP;
+        for (int i = 0; i < 50; ++i) {
+            if (fabsf(TestableZoomer::g_targetZoom.load() - TestableZoomer::g_zoom.load()) < ZOOM_SNAP) break;
+            TestableZoomer::UpdateLerp();
         }
+        TestableZoomer::UpdateLerp();
 
-        CHECK(cur == doctest::Approx(1.0f).epsilon(0.01));
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.0f));
     }
 
-    SUBCASE("invZoom updates correctly") {
+    SUBCASE("at the target the lerp does nothing") {
         TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_invZoom.store(1.0f / TestableZoomer::g_zoom.load());
-        CHECK(TestableZoomer::g_invZoom.load() == doctest::Approx(1.0f / 1.5f));
+        TestableZoomer::g_targetZoom.store(1.5f);
+
+        TestableZoomer::UpdateLerp();
+
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
+    }
+
+    SUBCASE("nested lerp is ignored while the camera moves") {
+        TestableZoomer::g_cameraBusy = true;
+        TestableZoomer::g_zoom.store(1.0f);
+        TestableZoomer::g_targetZoom.store(2.0f);
+
+        TestableZoomer::UpdateLerp();
+
+        CHECK(TestableZoomer::g_zoom.load() == 1.0f);
+        TestableZoomer::g_cameraBusy = false;
     }
 }
 
-// ==================== Constants ====================
-
-TEST_CASE("Constants") {
-    CHECK(ZOOM_DEFAULT == 1.0f);
-    CHECK(ZOOM_MIN == 1.0f);
-    CHECK(ZOOM_MAX == 4.0f);
-    CHECK(ZOOM_STEP == doctest::Approx(0.05f));
-    CHECK(ZOOM_LERP == doctest::Approx(0.15f));
-    CHECK(ZOOM_SNAP == doctest::Approx(0.001f));
-    CHECK(BLT_VTABLE_INDEX == 5);
-    CHECK(FLIP_VTABLE_INDEX == 11);
-    CHECK(BLTFAST_VTABLE_INDEX == 7);
-    CHECK(SIDEBAR_WIDTH == 168);
-    CHECK(BOTTOM_BAR_HEIGHT == 32);
-}
-
-// ==================== Zoom clamping ====================
-
-TEST_CASE("Zoom clamping") {
+TEST_CASE("UpdateLerpFrameIndependent") {
     TestableZoomer::ResetState();
 
-    SUBCASE("target clamped to MAX") {
-        float target = 5.0f;
-        if (target > ZOOM_MAX) target = ZOOM_MAX;
-        CHECK(target == ZOOM_MAX);
+    SUBCASE("no perf counter - falls back to UpdateLerp") {
+        TestableZoomer::g_perfCounterReady = false;
+        TestableZoomer::g_zoom.store(1.0f);
+        TestableZoomer::g_targetZoom.store(1.5f);
+
+        TestableZoomer::UpdateLerpFrameIndependent();
+
+        float newZoom = TestableZoomer::g_zoom.load();
+        CHECK(newZoom > 1.0f);
+        CHECK(newZoom < 1.5f);
     }
 
-    SUBCASE("target clamped to MIN") {
-        float target = 0.5f;
-        if (target < ZOOM_MIN) target = ZOOM_MIN;
-        CHECK(target == ZOOM_MIN);
+    SUBCASE("with perf counter - applies exponential interpolation") {
+        TestableZoomer::g_perfCounterReady = true;
+        QueryPerformanceFrequency(&TestableZoomer::g_perfFrequency);
+        QueryPerformanceCounter(&TestableZoomer::g_lastLerpTime);
+        TestableZoomer::g_zoom.store(1.0f);
+        TestableZoomer::g_targetZoom.store(1.5f);
+
+        TestableZoomer::UpdateLerpFrameIndependent();
+
+        float newZoom = TestableZoomer::g_zoom.load();
+        CHECK(newZoom > 1.0f);
+        CHECK(newZoom <= 1.5f);
     }
 
-    SUBCASE("target within range unchanged") {
-        float target = 1.3f;
-        if (target > ZOOM_MAX) target = ZOOM_MAX;
-        if (target < ZOOM_MIN) target = ZOOM_MIN;
-        CHECK(target == doctest::Approx(1.3f));
+    SUBCASE("snap when close to target") {
+        TestableZoomer::g_perfCounterReady = true;
+        QueryPerformanceFrequency(&TestableZoomer::g_perfFrequency);
+        QueryPerformanceCounter(&TestableZoomer::g_lastLerpTime);
+        TestableZoomer::g_zoom.store(1.4995f);
+        TestableZoomer::g_targetZoom.store(1.5f);
+
+        TestableZoomer::UpdateLerpFrameIndependent();
+
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
+    }
+
+    SUBCASE("already at target - no change") {
+        TestableZoomer::g_perfCounterReady = true;
+        QueryPerformanceFrequency(&TestableZoomer::g_perfFrequency);
+        QueryPerformanceCounter(&TestableZoomer::g_lastLerpTime);
+        TestableZoomer::g_zoom.store(1.5f);
+        TestableZoomer::g_targetZoom.store(1.5f);
+
+        TestableZoomer::UpdateLerpFrameIndependent();
+
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
+    }
+}
+
+// ==================== CommitZoom / camera plumbing ====================
+
+TEST_CASE("CommitZoom") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("stores zoom and its inverse") {
+        TestableZoomer::CommitZoom(2.0f);
+
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(2.0f));
+        CHECK(TestableZoomer::g_invZoom.load() == doctest::Approx(0.5f));
+        CHECK(TestableZoomer::g_cameraBusy == false);
+    }
+
+    SUBCASE("camera step does nothing when the game camera is unavailable") {
+        TestableZoomer::g_focusValid = true;
+        TestableZoomer::g_focusX = 800;
+        TestableZoomer::g_focusY = 540;
+
+        TestableZoomer::ApplyCameraStep(1.0f, 2.0f);
+
+        CHECK(TestableZoomer::g_camOffset.x == 0);
+        CHECK(TestableZoomer::g_camOffset.y == 0);
+    }
+
+    SUBCASE("zooming back to 1.0 drops the accumulated offset") {
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_invZoom.store(0.5f);
+        TestableZoomer::g_camOffset = { 40, -25 };
+
+        TestableZoomer::CommitZoom(1.0f);
+
+        CHECK(TestableZoomer::g_camOffset.x == 0);
+        CHECK(TestableZoomer::g_camOffset.y == 0);
+    }
+}
+
+// ==================== PanCamera ====================
+
+TEST_CASE("PanCamera") {
+    TestableZoomer::ResetState();
+    TestableZoomer::g_zoom.store(2.0f);
+    TestableZoomer::g_invZoom.store(0.5f);
+
+    SUBCASE("moves the anchor of the magnified view") {
+        TestableZoomer::g_centerX = 400;
+        TestableZoomer::g_centerY = 300;
+
+        TestableZoomer::PanCamera(50, -20);
+
+        CHECK(TestableZoomer::g_centerX.load() == 450);
+        CHECK(TestableZoomer::g_centerY.load() == 280);
+    }
+
+    SUBCASE("the anchor stops at the view rect") {
+        TestableZoomer::PanCamera(-1000, -1000);
+
+        // half of the magnified view is 200x150 pixels at 2.0x
+        CHECK(TestableZoomer::g_centerX.load() == 200);
+        CHECK(TestableZoomer::g_centerY.load() == 150);
+
+        TestableZoomer::PanCamera(1000, 1000);
+
+        CHECK(TestableZoomer::g_centerX.load() == 600);
+        CHECK(TestableZoomer::g_centerY.load() == 450);
+    }
+
+    SUBCASE("no movement at all is a no-op") {
+        TestableZoomer::g_centerX = 400;
+        TestableZoomer::PanCamera(0, 0);
+        CHECK(TestableZoomer::g_centerX.load() == 400);
+    }
+}
+
+// ==================== ResetZoom ====================
+
+TEST_CASE("ResetZoom") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("resets zoom to default") {
+        TestableZoomer::g_zoom.store(1.5f);
+        TestableZoomer::g_targetZoom.store(1.8f);
+        TestableZoomer::g_invZoom.store(0.5f);
+        TestableZoomer::g_focusValid = true;
+
+        TestableZoomer::ResetZoom();
+
+        CHECK(TestableZoomer::g_zoom.load() == ZOOM_DEFAULT);
+        CHECK(TestableZoomer::g_targetZoom.load() == ZOOM_DEFAULT);
+        CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
+        CHECK(TestableZoomer::g_focusValid == false);
+    }
+
+    SUBCASE("already at default - no change") {
+        TestableZoomer::g_zoom.store(ZOOM_DEFAULT);
+        TestableZoomer::g_targetZoom.store(ZOOM_DEFAULT);
+        TestableZoomer::g_invZoom.store(1.0f);
+
+        TestableZoomer::ResetZoom();
+
+        CHECK(TestableZoomer::g_zoom.load() == ZOOM_DEFAULT);
+        CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
+    }
+}
+
+// ==================== Shutdown ====================
+
+TEST_CASE("Shutdown") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("resets the zoom state") {
+        TestableZoomer::g_zoom.store(1.5f);
+        TestableZoomer::g_targetZoom.store(1.8f);
+        TestableZoomer::g_invZoom.store(0.666f);
+        TestableZoomer::g_initialized = true;
+
+        TestableZoomer::Shutdown();
+
+        CHECK(TestableZoomer::g_zoom.load() == ZOOM_DEFAULT);
+        CHECK(TestableZoomer::g_targetZoom.load() == ZOOM_DEFAULT);
+        CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
+        CHECK(TestableZoomer::g_initialized == false);
+    }
+
+    SUBCASE("restores the window proc if hooked") {
+        TestableZoomer::g_wndProcHooked = true;
+        TestableZoomer::OriginalWndProc = (WNDPROC)MockWndProc;
+
+        TestableZoomer::Shutdown();
+
+        CHECK(TestableZoomer::g_wndProcHooked == false);
+        CHECK(TestableZoomer::OriginalWndProc == nullptr);
+    }
+
+    SUBCASE("forgets the game view rect") {
+        TestableZoomer::SetViewRect({ 0, 0, 1752, 1248 }, true);
+
+        TestableZoomer::Shutdown();
+
+        CHECK(SameRect(TestableZoomer::ViewRect(), RECT{ 0, 0, 800, 600 }));
+        CHECK(TestableZoomer::g_viewRectFromGame == false);
+    }
+
+    SUBCASE("multiple calls are safe") {
+        TestableZoomer::Shutdown();
+        TestableZoomer::Shutdown();
+        CHECK(TestableZoomer::g_initialized == false);
     }
 }
 
@@ -1035,7 +776,7 @@ TEST_CASE("Mouse coordinate remapping") {
         CHECK(originalY == 640);
     }
 
-    SUBCASE("point at center - unchanged") {
+    SUBCASE("point at the anchor - unchanged") {
         TestableZoomer::g_zoom.store(1.5f);
         TestableZoomer::g_invZoom.store(1.0f / 1.5f);
 
@@ -1052,63 +793,39 @@ TEST_CASE("Mouse coordinate remapping") {
     }
 }
 
-// ==================== Dest detection ====================
+// ==================== Constants ====================
 
-TEST_CASE("Dest detection") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("map area computed from clientWidth minus fixed sizes") {
-        TestableZoomer::g_clientWidth = 1920;
-        TestableZoomer::g_clientHeight = 1080;
-        TestableZoomer::g_mapRight = TestableZoomer::g_clientWidth - SIDEBAR_WIDTH;
-        TestableZoomer::g_mapBottom = TestableZoomer::g_clientHeight - BOTTOM_BAR_HEIGHT + GUARD_LINES;
-        CHECK(TestableZoomer::g_mapRight == 1752);
-        CHECK(TestableZoomer::g_mapBottom == 1248);
-    }
-
-    SUBCASE("shutdown resets detection") {
-        TestableZoomer::g_destDetected = true;
-        TestableZoomer::g_mapRight = 1752;
-        TestableZoomer::g_mapBottom = 1248;
-        TestableZoomer::Shutdown();
-        CHECK(TestableZoomer::g_destDetected == false);
-        CHECK(TestableZoomer::g_mapRight == 0);
-        CHECK(TestableZoomer::g_mapBottom == 0);
-    }
+TEST_CASE("Constants") {
+    CHECK(ZOOM_DEFAULT == 1.0f);
+    CHECK(ZOOM_MIN == 1.0f);
+    CHECK(ZOOM_MAX == 4.0f);
+    CHECK(ZOOM_STEP == doctest::Approx(0.05f));
+    CHECK(ZOOM_LERP == doctest::Approx(0.15f));
+    CHECK(ZOOM_SNAP == doctest::Approx(0.001f));
+    CHECK(VK_0 == 0x30);
+    CHECK(GSCRIPT_ZOOM_FACTOR_RVA == 0x1739B0);
 }
 
-// ==================== GUARD_LINES ====================
+// ==================== Zoom clamping ====================
 
-TEST_CASE("Guard lines constant") {
-    CHECK(GUARD_LINES == 200);
-}
-
-// ==================== ResetZoom ====================
-
-TEST_CASE("ResetZoom") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("resets zoom to default") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.8f);
-        TestableZoomer::g_invZoom.store(0.5f);
-
-        TestableZoomer::ResetZoom();
-
-        CHECK(TestableZoomer::g_zoom.load() == ZOOM_DEFAULT);
-        CHECK(TestableZoomer::g_targetZoom.load() == ZOOM_DEFAULT);
-        CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
+TEST_CASE("Zoom clamping") {
+    SUBCASE("target clamped to MAX") {
+        float target = 5.0f;
+        if (target > ZOOM_MAX) target = ZOOM_MAX;
+        CHECK(target == ZOOM_MAX);
     }
 
-    SUBCASE("already at default - no change") {
-        TestableZoomer::g_zoom.store(ZOOM_DEFAULT);
-        TestableZoomer::g_targetZoom.store(ZOOM_DEFAULT);
-        TestableZoomer::g_invZoom.store(1.0f);
+    SUBCASE("target clamped to MIN") {
+        float target = 0.5f;
+        if (target < ZOOM_MIN) target = ZOOM_MIN;
+        CHECK(target == ZOOM_MIN);
+    }
 
-        TestableZoomer::ResetZoom();
-
-        CHECK(TestableZoomer::g_zoom.load() == ZOOM_DEFAULT);
-        CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
+    SUBCASE("target within range unchanged") {
+        float target = 1.3f;
+        if (target > ZOOM_MAX) target = ZOOM_MAX;
+        if (target < ZOOM_MIN) target = ZOOM_MIN;
+        CHECK(target == doctest::Approx(1.3f));
     }
 }
 
@@ -1172,208 +889,297 @@ TEST_CASE("GameCamera::ComputeShift") {
     }
 }
 
-// ==================== CommitZoom / camera plumbing ====================
+// ==================== RenderZoom::ComputeSourceRect ====================
 
-TEST_CASE("CommitZoom") {
-    TestableZoomer::ResetState();
+TEST_CASE("RenderZoom::ComputeSourceRect") {
+    using SR = RenderZoom::SourceRect;
 
-    SUBCASE("stores zoom and its inverse") {
-        TestableZoomer::CommitZoom(2.0f);
+    auto same = [](const SR& r, int x, int y, int w, int h) {
+        return r.X == x && r.Y == y && r.W == w && r.H == h;
+    };
 
-        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(2.0f));
-        CHECK(TestableZoomer::g_invZoom.load() == doctest::Approx(0.5f));
-        CHECK(TestableZoomer::g_cameraBusy == false);
+    SUBCASE("zoomed out - the whole view is the source") {
+        SR r = RenderZoom::ComputeSourceRect(800, 600, 400, 300, 1.0f);
+        CHECK(same(r, 0, 0, 800, 600));
     }
 
-    SUBCASE("nested lerp is ignored while the camera moves") {
-        TestableZoomer::g_cameraBusy = true;
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(2.0f);
-
-        TestableZoomer::UpdateLerp();
-
-        CHECK(TestableZoomer::g_zoom.load() == 1.0f);
-        TestableZoomer::g_cameraBusy = false;
+    SUBCASE("exactly at the epsilon - still the whole view") {
+        SR r = RenderZoom::ComputeSourceRect(800, 600, 400, 300, 1.001f);
+        CHECK(same(r, 0, 0, 800, 600));
     }
 
-    SUBCASE("camera step does nothing when the game camera is unavailable") {
-        TestableZoomer::g_focusValid = true;
-        TestableZoomer::g_focusX = 800;
-        TestableZoomer::g_focusY = 540;
-
-        TestableZoomer::ApplyCameraStep(1.0f, 2.0f);
-
-        CHECK(TestableZoomer::g_camOffset.x == 0);
-        CHECK(TestableZoomer::g_camOffset.y == 0);
+    SUBCASE("doubled zoom takes a centered quarter") {
+        SR r = RenderZoom::ComputeSourceRect(100, 100, 50, 50, 2.0f);
+        CHECK(same(r, 25, 25, 50, 50));
     }
 
-    SUBCASE("zooming back to 1.0 drops the accumulated offset") {
-        TestableZoomer::g_zoom.store(2.0f);
-        TestableZoomer::g_invZoom.store(0.5f);
-        TestableZoomer::g_camOffset = { 40, -25 };
-
-        TestableZoomer::CommitZoom(1.0f);
-
-        CHECK(TestableZoomer::g_camOffset.x == 0);
-        CHECK(TestableZoomer::g_camOffset.y == 0);
+    SUBCASE("the rect scales with the zoom factor") {
+        SR r = RenderZoom::ComputeSourceRect(100, 100, 50, 50, 4.0f);
+        CHECK(same(r, 38, 38, 25, 25));
     }
 
-    SUBCASE("pan without a game camera moves the crop center") {
-        TestableZoomer::g_zoom.store(2.0f);
-        TestableZoomer::g_centerX = 400;
-        TestableZoomer::g_centerY = 300;
-
-        TestableZoomer::PanCamera(50, -20);
-
-        CHECK(TestableZoomer::g_centerX.load() == 450);
-        CHECK(TestableZoomer::g_centerY.load() == 280);
+    SUBCASE("half up rounding of an odd source size") {
+        SR r = RenderZoom::ComputeSourceRect(800, 600, 400, 300, 1.5f);
+        CHECK(same(r, 133, 100, 534, 400));
     }
-}
 
-// ==================== DetectDDrawWrapper ====================
+    SUBCASE("anchor near the left edge clamps the origin") {
+        SR r = RenderZoom::ComputeSourceRect(100, 100, 10, 50, 2.0f);
+        CHECK(same(r, 0, 25, 50, 50));
+    }
 
-TEST_CASE("DetectDDrawWrapper") {
-    TestableZoomer::ResetState();
+    SUBCASE("anchor near the right edge clamps the width") {
+        SR r = RenderZoom::ComputeSourceRect(100, 100, 95, 50, 2.0f);
+        CHECK(same(r, 70, 25, 30, 50));
+    }
 
-    SUBCASE("returns a valid enum value") {
-        DDrawWrapper w = TestableZoomer::DetectDDrawWrapper();
-        bool valid = (w == DDrawWrapper::Original ||
-                      w == DDrawWrapper::CncDDraw ||
-                      w == DDrawWrapper::TsDDraw ||
-                      w == DDrawWrapper::DDrawCompat ||
-                      w == DDrawWrapper::Unknown);
-        CHECK(valid);
+    SUBCASE("anchor near the bottom clamps the height") {
+        SR r = RenderZoom::ComputeSourceRect(100, 100, 50, 95, 2.0f);
+        CHECK(same(r, 25, 70, 50, 30));
+    }
+
+    SUBCASE("zero sized view") {
+        SR r = RenderZoom::ComputeSourceRect(0, 0, 0, 0, 2.0f);
+        CHECK(same(r, 0, 0, 0, 0));
+    }
+
+    SUBCASE("a source below one pixel falls back to the whole view") {
+        SR r = RenderZoom::ComputeSourceRect(4, 4, 2, 2, 10.0f);
+        CHECK(same(r, 0, 0, 4, 4));
+    }
+
+    SUBCASE("the smallest possible source is a single pixel") {
+        SR r = RenderZoom::ComputeSourceRect(4, 4, 2, 2, 4.0f);
+        CHECK(same(r, 2, 2, 1, 1));
     }
 }
 
-// ==================== UpdateMonitorInfo ====================
+// ==================== RenderZoom::Upscale ====================
 
-TEST_CASE("UpdateMonitorInfo") {
-    TestableZoomer::ResetState();
+TEST_CASE("RenderZoom::Upscale") {
+    SUBCASE("doubles the backup") {
+        std::vector<unsigned short> backup(4 * 4);
+        for (int i = 0; i < 16; ++i) backup[i] = (unsigned short)(i + 1);
 
-    SUBCASE("null hWnd does not crash") {
-        TestableZoomer::UpdateMonitorInfo(nullptr);
-        CHECK(TestableZoomer::g_hMonitor == nullptr);
+        std::vector<unsigned short> dst(8 * 8, 0);
+        RenderZoom::SourceRect src = { 0, 0, 4, 4 };
+        RenderZoom::Upscale(backup.data(), 4, dst.data(), 8, 8, 8, src);
+
+        // nearest neighbour: two destination pixels per source pixel
+        CHECK(dst[0] == backup[0]);
+        CHECK(dst[1] == backup[0]);
+        CHECK(dst[2] == backup[1]);
+        CHECK(dst[3] == backup[1]);
+        CHECK(dst[4] == backup[2]);
+
+        CHECK(dst[8] == backup[0]);    // second row still reads the first
+        CHECK(dst[56] == backup[12]);  // last row reads the last source row
     }
 
-    SUBCASE("valid hWnd sets monitor info") {
-        HWND hWnd = GetDesktopWindow();
-        TestableZoomer::UpdateMonitorInfo(hWnd);
-        CHECK(TestableZoomer::g_hMonitor != nullptr);
-        CHECK(TestableZoomer::g_monitorWidth > 0);
-        CHECK(TestableZoomer::g_monitorHeight > 0);
+    SUBCASE("a source rect selects the sub region") {
+        std::vector<unsigned short> backup(4 * 4);
+        for (int i = 0; i < 16; ++i) backup[i] = (unsigned short)(i + 1);
+
+        std::vector<unsigned short> dst(4 * 4, 0);
+        RenderZoom::SourceRect src = { 1, 1, 2, 2 };
+        RenderZoom::Upscale(backup.data(), 4, dst.data(), 4, 4, 4, src);
+
+        CHECK(dst[0] == backup[5]);
+        CHECK(dst[1] == backup[5]);
+        CHECK(dst[2] == backup[6]);
+        CHECK(dst[3] == backup[6]);
+        CHECK(dst[12] == backup[9]);
+    }
+
+    SUBCASE("the destination may be wider than the backup") {
+        std::vector<unsigned short> backup(2 * 2, 7);
+        std::vector<unsigned short> dst(8, 0);
+        RenderZoom::SourceRect src = { 0, 0, 2, 2 };
+        RenderZoom::Upscale(backup.data(), 2, dst.data(), 4, 4, 2, src);
+
+        CHECK(dst[0] == 7);
+        CHECK(dst[3] == 7);
+    }
+
+    SUBCASE("degenerate input is ignored") {
+        std::vector<unsigned short> backup(4, 1);
+        std::vector<unsigned short> dst(4, 99);
+
+        RenderZoom::SourceRect empty = { 0, 0, 0, 4 };
+        RenderZoom::Upscale(backup.data(), 2, dst.data(), 2, 2, 2, empty);
+        CHECK(dst[0] == 99);
+
+        RenderZoom::SourceRect full = { 0, 0, 2, 2 };
+        RenderZoom::Upscale(nullptr, 2, dst.data(), 2, 2, 2, full);
+        CHECK(dst[0] == 99);
     }
 }
 
-// ==================== UpdateLerpFrameIndependent ====================
+// ==================== RenderZoom::CopyRows ====================
 
-TEST_CASE("UpdateLerpFrameIndependent") {
+TEST_CASE("RenderZoom::CopyRows") {
+    // 8 pixels wide, 4 rows deep, 16 bit pixels
+    auto makeSurface = []() {
+        std::vector<unsigned char> surf(16 * 4, 0);
+        for (int i = 0; i < 16 * 4; ++i) surf[i] = (unsigned char)(i & 0xFF);
+        return surf;
+    };
+    const RECT view = { 2, 1, 6, 3 };  // 4x2 pixels
+
+    SUBCASE("copies the view into the backup") {
+        std::vector<unsigned char> surf = makeSurface();
+        std::vector<unsigned char> backup(4 * 2 * 2, 0);
+
+        bool ok = RenderZoom::CopyRows(surf.data(), 16, view, backup.data(), 4, 2, true);
+
+        CHECK(ok);
+        CHECK(memcmp(backup.data(), surf.data() + 16 + 4, 8) == 0);
+        CHECK(memcmp(backup.data() + 8, surf.data() + 32 + 4, 8) == 0);
+    }
+
+    SUBCASE("writes the backup back into the view") {
+        std::vector<unsigned char> surf = makeSurface();
+        const std::vector<unsigned char> original = surf;
+        std::vector<unsigned char> backup(4 * 2 * 2, 0x5A);
+
+        bool ok = RenderZoom::CopyRows(surf.data(), 16, view, backup.data(), 4, 2, false);
+
+        CHECK(ok);
+        CHECK(memcmp(surf.data() + 16 + 4, backup.data(), 8) == 0);
+        CHECK(memcmp(surf.data() + 32 + 4, backup.data() + 8, 8) == 0);
+
+        // everything outside the view rect stays untouched
+        const int expectedBytes = (view.right - view.left) * (view.bottom - view.top) * 2;
+        int changed = 0;
+        for (size_t i = 0; i < surf.size(); ++i) {
+            const int col = (int)(i % 16) / 2;
+            const int row = (int)(i / 16);
+            const bool inView = col >= view.left && col < view.right
+                && row >= view.top && row < view.bottom;
+            if (inView) {
+                ++changed;
+            } else if (surf[i] != original[i]) {
+                changed = -1;
+                break;
+            }
+        }
+        CHECK(changed == expectedBytes);
+    }
+
+    SUBCASE("null arguments") {
+        std::vector<unsigned char> surf = makeSurface();
+        std::vector<unsigned char> backup(16, 0);
+        CHECK(RenderZoom::CopyRows(nullptr, 16, view, backup.data(), 4, 2, true) == false);
+        CHECK(RenderZoom::CopyRows(surf.data(), 16, view, nullptr, 4, 2, true) == false);
+    }
+
+    SUBCASE("a view larger than the backup is rejected") {
+        std::vector<unsigned char> surf = makeSurface();
+        std::vector<unsigned char> backup(4, 0);
+        CHECK(RenderZoom::CopyRows(surf.data(), 16, view, backup.data(), 1, 1, true) == false);
+    }
+
+    SUBCASE("a pitch that cannot hold the view is rejected") {
+        std::vector<unsigned char> surf = makeSurface();
+        std::vector<unsigned char> backup(16, 0);
+        CHECK(RenderZoom::CopyRows(surf.data(), 6, view, backup.data(), 4, 2, true) == false);
+    }
+
+    SUBCASE("an inverted view is rejected") {
+        std::vector<unsigned char> surf = makeSurface();
+        std::vector<unsigned char> backup(16, 0);
+        RECT inverted = { 6, 3, 2, 1 };
+        CHECK(RenderZoom::CopyRows(surf.data(), 16, inverted, backup.data(), 4, 2, true) == false);
+    }
+}
+
+// ==================== RenderZoom::AcceptViewRect ====================
+
+TEST_CASE("RenderZoom::AcceptViewRect") {
+    RenderZoom::ResetFrameState();
+    const RECT small = { 0, 0, 800, 600 };
+    const RECT game = { 0, 0, 1752, 1248 };
+
+    SUBCASE("the first rect is accepted immediately") {
+        CHECK(RenderZoom::AcceptViewRect(small, 0) == true);
+
+        RECT cached = {};
+        REQUIRE(RenderZoom::CachedViewRect(cached));
+        CHECK(SameRect(cached, small));
+    }
+
+    SUBCASE("an invalid rect is rejected") {
+        RECT bad = { 100, 100, 50, 50 };
+        CHECK(RenderZoom::AcceptViewRect(bad, 0) == false);
+
+        RECT cached = {};
+        CHECK(RenderZoom::CachedViewRect(cached) == false);
+    }
+
+    SUBCASE("the game rect is polled at most every 250 ms") {
+        CHECK(RenderZoom::AcceptViewRect(small, 0) == true);
+        CHECK(RenderZoom::AcceptViewRect(game, 100) == false);
+
+        RECT cached = {};
+        REQUIRE(RenderZoom::CachedViewRect(cached));
+        CHECK(SameRect(cached, small));
+
+        CHECK(RenderZoom::AcceptViewRect(game, 250) == true);
+        REQUIRE(RenderZoom::CachedViewRect(cached));
+        CHECK(SameRect(cached, game));
+    }
+
+    SUBCASE("an unchanged rect is not published again") {
+        CHECK(RenderZoom::AcceptViewRect(small, 0) == true);
+        CHECK(RenderZoom::AcceptViewRect(small, 300) == false);
+        CHECK(RenderZoom::AcceptViewRect(small, 600) == false);
+    }
+
+    SUBCASE("resetting forgets the debounce") {
+        CHECK(RenderZoom::AcceptViewRect(small, 0) == true);
+        RenderZoom::ResetFrameState();
+
+        RECT cached = {};
+        CHECK(RenderZoom::CachedViewRect(cached) == false);
+        CHECK(RenderZoom::AcceptViewRect(small, 10) == true);
+    }
+}
+
+// ==================== RenderZoom frame hooks ====================
+
+TEST_CASE("RenderZoom frame hooks") {
     TestableZoomer::ResetState();
 
-    SUBCASE("no perf counter - falls back to UpdateLerp") {
+    SUBCASE("a disabled module does nothing") {
+        CHECK(RenderZoom::PreRender() == false);
+        RenderZoom::PostRender();
+
+        RECT cached = {};
+        CHECK(RenderZoom::CachedViewRect(cached) == false);
+    }
+
+    SUBCASE("without the game data there is nothing to magnify") {
+        RenderZoom::SetEnabled(true);
+        TestableZoomer::g_zoom.store(1.5f);
+        TestableZoomer::g_invZoom.store(1.0f / 1.5f);
+
+        CHECK(RenderZoom::PreRender() == false);
+        RenderZoom::PostRender();
+
+        // no backup was taken, so the next frame has nothing to restore
+        CHECK(RenderZoom::PreRender() == false);
+        RECT cached = {};
+        CHECK(RenderZoom::CachedViewRect(cached) == false);
+    }
+
+    SUBCASE("pre render advances the zoom lerp before the frame is drawn") {
+        RenderZoom::SetEnabled(true);
         TestableZoomer::g_perfCounterReady = false;
         TestableZoomer::g_zoom.store(1.0f);
         TestableZoomer::g_targetZoom.store(1.5f);
 
-        TestableZoomer::UpdateLerpFrameIndependent();
-
-        float newZoom = TestableZoomer::g_zoom.load();
-        CHECK(newZoom > 1.0f);
-        CHECK(newZoom < 1.5f);
+        CHECK(RenderZoom::PreRender() == false);
+        CHECK(TestableZoomer::g_zoom.load() > 1.0f);
+        CHECK(TestableZoomer::g_zoom.load() < 1.5f);
     }
-
-    SUBCASE("with perf counter - applies exponential interpolation") {
-        TestableZoomer::g_perfCounterReady = true;
-        QueryPerformanceFrequency(&TestableZoomer::g_perfFrequency);
-        QueryPerformanceCounter(&TestableZoomer::g_lastLerpTime);
-        TestableZoomer::g_zoom.store(1.0f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        TestableZoomer::UpdateLerpFrameIndependent();
-
-        float newZoom = TestableZoomer::g_zoom.load();
-        CHECK(newZoom > 1.0f);
-        CHECK(newZoom <= 1.5f);
-    }
-
-    SUBCASE("snap when close to target") {
-        TestableZoomer::g_perfCounterReady = true;
-        QueryPerformanceFrequency(&TestableZoomer::g_perfFrequency);
-        QueryPerformanceCounter(&TestableZoomer::g_lastLerpTime);
-        TestableZoomer::g_zoom.store(1.4995f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        TestableZoomer::UpdateLerpFrameIndependent();
-
-        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
-    }
-
-    SUBCASE("already at target - no change") {
-        TestableZoomer::g_perfCounterReady = true;
-        QueryPerformanceFrequency(&TestableZoomer::g_perfFrequency);
-        QueryPerformanceCounter(&TestableZoomer::g_lastLerpTime);
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.5f);
-
-        TestableZoomer::UpdateLerpFrameIndependent();
-
-        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
-    }
-}
-
-// ==================== Ctrl+0 hotkey ====================
-
-TEST_CASE("Ctrl+0 hotkey") {
-    TestableZoomer::ResetState();
-
-    MockWindow win;
-    REQUIRE(win.Create());
-    TestableZoomer::g_hWnd = win.hWnd;
-    TestableZoomer::UpdateClientCache(win.hWnd);
-    TestableZoomer::UpdateCenter(win.hWnd);
-
-    SUBCASE("0 without Ctrl - does not reset zoom") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.8f);
-
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_0, 0);
-
-        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
-        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.8f));
-    }
-
-    SUBCASE("non-VK_0 key - does not reset zoom") {
-        TestableZoomer::g_zoom.store(1.5f);
-        TestableZoomer::g_targetZoom.store(1.8f);
-
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, 0x41, 0);
-
-        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
-    }
-}
-
-// ==================== UpdateClientCache with guard lines ====================
-
-TEST_CASE("UpdateClientCache guard lines") {
-    TestableZoomer::ResetState();
-
-    SUBCASE("mapBottom includes guard lines") {
-        HWND hWnd = GetDesktopWindow();
-        TestableZoomer::UpdateClientCache(hWnd);
-        int expected = TestableZoomer::g_clientHeight - BOTTOM_BAR_HEIGHT + GUARD_LINES;
-        CHECK(TestableZoomer::g_mapBottom == expected);
-    }
-
-    SUBCASE("mapRight unchanged by guard lines") {
-        HWND hWnd = GetDesktopWindow();
-        TestableZoomer::UpdateClientCache(hWnd);
-        int expected = TestableZoomer::g_clientWidth - SIDEBAR_WIDTH;
-        CHECK(TestableZoomer::g_mapRight == expected);
-    }
-}
-
-// ==================== VK_0 constant ====================
-
-TEST_CASE("VK_0 constant") {
-    CHECK(VK_0 == 0x30);
 }

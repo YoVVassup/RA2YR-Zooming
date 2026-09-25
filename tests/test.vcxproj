@@ -56,10 +56,10 @@
     <ClCompile Include="test_zoomer.cpp" />
     <ClCompile Include="..\src\Zoomer.cpp" />
     <ClCompile Include="..\src\GameCamera.cpp" />
+    <ClCompile Include="..\src\RenderZoom.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="doctest.h" />
-    <ClInclude Include="mock_ddraw.h" />
     <ClInclude Include="mock_window.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
