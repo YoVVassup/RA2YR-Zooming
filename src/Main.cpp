@@ -50,3 +50,20 @@ DEFINE_HOOK(0x4F451B, ViewCtrlPostRenderZoom, 0x5)
 	R->EAX(eax);
 	return 0x4F4520;
 }
+
+// 0x6D864E: "mov ebx, dword ptr [0x886FA8]" — the view width ClampCoordMap
+// clamps the viewport against. 6 bytes, execution continues at 0x6D8654.
+// The 0x6D868A hook below replaces the matching view height read.
+DEFINE_HOOK(0x6D864E, ViewCtrlClampWidth, 0x6)
+{
+	R->EBX((DWORD)RenderZoom::ClampWidth());
+	return 0x6D8654;
+}
+
+// 0x6D868A: "mov ebx, dword ptr [0x886FAC]" — the view height. Runs after the
+// width was already used, so only the height half of the clamp changes here.
+DEFINE_HOOK(0x6D868A, ViewCtrlClampHeight, 0x6)
+{
+	R->EBX((DWORD)RenderZoom::ClampHeight());
+	return 0x6D8690;
+}

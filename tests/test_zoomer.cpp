@@ -1183,3 +1183,26 @@ TEST_CASE("RenderZoom frame hooks") {
         CHECK(TestableZoomer::g_zoom.load() < 1.5f);
     }
 }
+
+
+// ==================== RenderZoom clamp sizes ====================
+
+TEST_CASE("RenderZoom::ClampDimension") {
+    SUBCASE("not magnified - the game dimension stands") {
+        CHECK(RenderZoom::ClampDimension(640, 320, false) == 640);
+    }
+
+    SUBCASE("magnified - the source rect size is used") {
+        CHECK(RenderZoom::ClampDimension(640, 320, true) == 320);
+    }
+
+    SUBCASE("an unusable source rect falls back to the game dimension") {
+        CHECK(RenderZoom::ClampDimension(640, 0, true) == 640);
+        CHECK(RenderZoom::ClampDimension(640, -1, true) == 640);
+    }
+
+    SUBCASE("outside the game there is no dimension to read") {
+        CHECK(RenderZoom::ClampWidth() == 0);
+        CHECK(RenderZoom::ClampHeight() == 0);
+    }
+}

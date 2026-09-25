@@ -161,6 +161,32 @@ namespace
 		UnlockSurface();
 		return ok;
 	}
+
+	// Everything the replaced "mov ebx, [0x886FA8]" / "[0x886FAC]" would have
+	// loaded, swapped for the visible source rect while the view is magnified.
+	int ClampViewDimension(bool width)
+	{
+		const DWORD address = ADDR_VIEW_BOUNDS + (width ? 2 : 3) * sizeof(int);
+		if (!IsGameReadable(reinterpret_cast<const void*>(address), sizeof(int))) return 0;
+		const int gameDim = *reinterpret_cast<const int*>(address);
+
+		const float zoom = Zoomer::CurrentZoom();
+		if (zoom <= ZOOM_EPSILON) return gameDim;
+
+		// Telescope only substitutes once a view rect has been observed;
+		// before that the game dimension stands.
+		RECT view = {};
+		if (!RenderZoom::CachedViewRect(view)) return gameDim;
+
+		const int viewW = view.right - view.left;
+		const int viewH = view.bottom - view.top;
+		if (viewW <= 0 || viewH <= 0) return gameDim;
+
+		const POINT anchor = Zoomer::ZoomAnchor();
+		const RenderZoom::SourceRect src = RenderZoom::ComputeSourceRect(
+			viewW, viewH, anchor.x - view.left, anchor.y - view.top, zoom);
+		return RenderZoom::ClampDimension(gameDim, width ? src.W : src.H, true);
+	}
 }
 
 void RenderZoom::Init(bool zoomEnabled)
@@ -392,4 +418,20 @@ bool RenderZoom::CachedViewRect(RECT& out)
 	if (!g_viewRectValid) return false;
 	out = g_viewRect;
 	return true;
+}
+
+int RenderZoom::ClampWidth()
+{
+	return ClampViewDimension(true);
+}
+
+int RenderZoom::ClampHeight()
+{
+	return ClampViewDimension(false);
+}
+
+int RenderZoom::ClampDimension(int gameDim, int srcDim, bool magnified)
+{
+	if (magnified && srcDim > 0) return srcDim;
+	return gameDim;
 }

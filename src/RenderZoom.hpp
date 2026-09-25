@@ -57,6 +57,17 @@ public:
 
 	static bool CachedViewRect(RECT& out);
 
+	// Sizes ClampCoordMap clamps the viewport against, reached from
+	// 0x6D864E (width) and 0x6D868A (height). Both instructions read
+	// DSurface::ViewBounds; while the view is magnified the visible world
+	// area is the source rect instead, so the game clamps against that.
+	static int ClampWidth();
+	static int ClampHeight();
+
+	// Rule behind both: a usable source rect size stands in for the game
+	// dimension only while the view is magnified.
+	static int ClampDimension(int gameDim, int srcDim, bool magnified);
+
 	// Drops the backup buffer and the debounced view rect (tests / shutdown).
 	static void ResetFrameState();
 
