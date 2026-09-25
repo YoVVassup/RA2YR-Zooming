@@ -7,14 +7,15 @@
 constexpr float ZOOM_DEFAULT = 1.0f;
 constexpr float ZOOM_MIN = 1.0f;
 constexpr float ZOOM_MAX = 4.0f;
-constexpr float ZOOM_STEP = 0.05f;
+constexpr float ZOOM_GEAR = 1.15f;
 constexpr float ZOOM_LERP = 0.15f;
 constexpr float ZOOM_SNAP = 0.001f;
 
+// Maximum gap between two key presses that counts as a double press.
+constexpr DWORD DOUBLE_PRESS_MS = 400;
+
 constexpr size_t GSCRIPT_ZOOM_FACTOR_RVA = 0x1739B0;
 constexpr BYTE   GSCRIPT_ZOOM_FACTOR_BYTES[] = { 0xB0, 0x39, 0x17, 0x10 };
-
-constexpr BYTE VK_0 = 0x30;
 
 class Zoomer
 {
@@ -63,6 +64,18 @@ private:
 	static void PanCamera(int dx, int dy);
 	static void ResetZoom();
 
+	// True while Ctrl is physically held (tests inject the state instead of
+	// pressing real keys).
+	static bool CtrlHeld();
+
+	// Wheel zoom: multiplies the factor by ZOOM_GEAR per scroll step in the
+	// given direction and clamps it into [ZOOM_MIN, ZOOM_MAX].
+	static float ApplyWheelSteps(float zoom, int steps);
+
+	// Registers a key press at nowMs and returns true when it completes a
+	// double press within DOUBLE_PRESS_MS of the previous one.
+	static bool RegisterDoublePress(DWORD nowMs);
+
 	static BOOL WINAPI HookedGetCursorPos(LPPOINT lpPoint);
 	static LRESULT CALLBACK NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 	static DWORD WINAPI InitThread(LPVOID lpParam);
@@ -96,6 +109,15 @@ private:
 	// True while the camera is being moved, so a repaint triggered from inside
 	// GameCamera::ShiftBy() cannot start another zoom step.
 	static inline bool     g_cameraBusy = false;
+
+	// Double press bookkeeping for the Alt-resets-the-zoom hotkey.
+	static inline DWORD    g_lastPressMs = 0;
+	static inline bool     g_haveLastPress = false;
+
+#ifdef VIEWCTRL_TEST
+	// Wheel zoom modifier injected by the unit tests.
+	static inline bool     g_ctrlHeld = false;
+#endif
 
 	static inline WNDPROC  OriginalWndProc = nullptr;
 	static inline void*    OriginalGetCursorPos = nullptr;

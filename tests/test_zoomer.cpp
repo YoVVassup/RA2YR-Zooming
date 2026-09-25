@@ -60,6 +60,9 @@ public:
         g_perfFrequency = {};
         g_useGScript = false;
         g_pZoomFactor = nullptr;
+        g_ctrlHeld = false;
+        g_haveLastPress = false;
+        g_lastPressMs = 0;
         if (g_hThread) { CloseHandle(g_hThread); g_hThread = nullptr; }
         RenderZoom::ResetFrameState();
         RenderZoom::SetEnabled(false);
@@ -75,6 +78,9 @@ public:
     using Zoomer::UndoCameraOffset;
     using Zoomer::PanCamera;
     using Zoomer::ResetZoom;
+    using Zoomer::CtrlHeld;
+    using Zoomer::ApplyWheelSteps;
+    using Zoomer::RegisterDoublePress;
     using Zoomer::HookedGetCursorPos;
     using Zoomer::NewWndProc;
     using Zoomer::Shutdown;
@@ -321,24 +327,39 @@ TEST_CASE("NewWndProc") {
     TestableZoomer::UpdateClientCache(win.hWnd);
 
     SUBCASE("WM_MOUSEWHEEL zoom in") {
+        TestableZoomer::g_ctrlHeld = true;
         TestableZoomer::g_targetZoom.store(1.0f);
         LPARAM lParam = MAKELPARAM(400, 300);
 
         TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120), lParam);
 
-        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.05f));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(ZOOM_GEAR));
     }
 
     SUBCASE("WM_MOUSEWHEEL zoom out") {
+        TestableZoomer::g_ctrlHeld = true;
         TestableZoomer::g_targetZoom.store(1.5f);
         LPARAM lParam = MAKELPARAM(400, 300);
 
         TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -120), lParam);
 
-        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.45f));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.5f / ZOOM_GEAR));
+    }
+
+    SUBCASE("WM_MOUSEWHEEL without Ctrl - passes to the game") {
+        TestableZoomer::g_ctrlHeld = false;
+        TestableZoomer::g_focusValid = false;
+        TestableZoomer::g_targetZoom.store(1.0f);
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
+                                   MAKELPARAM(400, 300));
+
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.0f));
+        CHECK(!TestableZoomer::g_focusValid);
     }
 
     SUBCASE("WM_MOUSEWHEEL clamps to MAX") {
+        TestableZoomer::g_ctrlHeld = true;
         TestableZoomer::g_targetZoom.store(3.95f);
         TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
                                    MAKELPARAM(400, 300));
@@ -346,6 +367,7 @@ TEST_CASE("NewWndProc") {
     }
 
     SUBCASE("WM_MOUSEWHEEL clamps to MIN") {
+        TestableZoomer::g_ctrlHeld = true;
         TestableZoomer::g_targetZoom.store(1.0f);
         TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -120),
                                    MAKELPARAM(400, 300));
@@ -353,6 +375,7 @@ TEST_CASE("NewWndProc") {
     }
 
     SUBCASE("WM_MOUSEWHEEL outside the view rect - ignored") {
+        TestableZoomer::g_ctrlHeld = true;
         TestableZoomer::g_targetZoom.store(1.0f);
         TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
                                    MAKELPARAM(1900, 1300));
@@ -361,6 +384,7 @@ TEST_CASE("NewWndProc") {
     }
 
     SUBCASE("WM_MOUSEWHEEL latches the focus instead of moving the anchor") {
+        TestableZoomer::g_ctrlHeld = true;
         TestableZoomer::g_focusValid = false;
         TestableZoomer::g_targetZoom.store(1.0f);
         const LONG prevCenterX = TestableZoomer::g_centerX.load();
@@ -427,9 +451,9 @@ TEST_CASE("NewWndProc") {
     }
 }
 
-// ==================== Ctrl+0 hotkey ====================
+// ==================== Double Alt reset ====================
 
-TEST_CASE("Ctrl+0 hotkey") {
+TEST_CASE("Double Alt reset") {
     TestableZoomer::ResetState();
 
     MockWindow win;
@@ -437,23 +461,44 @@ TEST_CASE("Ctrl+0 hotkey") {
     TestableZoomer::g_hWnd = win.hWnd;
     TestableZoomer::UpdateClientCache(win.hWnd);
 
-    SUBCASE("0 without Ctrl - does not reset zoom") {
+    SUBCASE("single Alt - does not reset zoom") {
         TestableZoomer::g_zoom.store(1.5f);
         TestableZoomer::g_targetZoom.store(1.8f);
 
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_0, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
 
         CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
         CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.8f));
     }
 
-    SUBCASE("non-VK_0 key - does not reset zoom") {
+    SUBCASE("Alt with the key repeat bit - ignored") {
         TestableZoomer::g_zoom.store(1.5f);
         TestableZoomer::g_targetZoom.store(1.8f);
 
-        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, 0x41, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0x40000000);
 
         CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(1.5f));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.8f));
+    }
+
+    SUBCASE("double Alt - resets the zoom") {
+        TestableZoomer::g_zoom.store(2.5f);
+        TestableZoomer::g_targetZoom.store(2.8f);
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_MENU, 0);
+
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(ZOOM_DEFAULT));
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(ZOOM_DEFAULT));
+    }
+
+    SUBCASE("double press window") {
+        CHECK(!TestableZoomer::RegisterDoublePress(1000));
+        CHECK(TestableZoomer::RegisterDoublePress(1300));
+        CHECK(!TestableZoomer::RegisterDoublePress(1400));
+        CHECK(!TestableZoomer::RegisterDoublePress(1400 + DOUBLE_PRESS_MS + 1));
+        CHECK(TestableZoomer::RegisterDoublePress(1400 + DOUBLE_PRESS_MS + 1 + 300));
     }
 }
 
@@ -799,11 +844,32 @@ TEST_CASE("Constants") {
     CHECK(ZOOM_DEFAULT == 1.0f);
     CHECK(ZOOM_MIN == 1.0f);
     CHECK(ZOOM_MAX == 4.0f);
-    CHECK(ZOOM_STEP == doctest::Approx(0.05f));
+    CHECK(ZOOM_GEAR == doctest::Approx(1.15f));
     CHECK(ZOOM_LERP == doctest::Approx(0.15f));
     CHECK(ZOOM_SNAP == doctest::Approx(0.001f));
-    CHECK(VK_0 == 0x30);
+    CHECK(DOUBLE_PRESS_MS == 400);
     CHECK(GSCRIPT_ZOOM_FACTOR_RVA == 0x1739B0);
+}
+
+// ==================== ApplyWheelSteps ====================
+
+TEST_CASE("ApplyWheelSteps") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("one step gears the zoom") {
+        CHECK(TestableZoomer::ApplyWheelSteps(1.0f, 1) == doctest::Approx(ZOOM_GEAR));
+        CHECK(TestableZoomer::ApplyWheelSteps(2.0f, -1) == doctest::Approx(2.0f / ZOOM_GEAR));
+        CHECK(TestableZoomer::ApplyWheelSteps(2.0f, 2) == doctest::Approx(2.0f * ZOOM_GEAR * ZOOM_GEAR));
+    }
+
+    SUBCASE("zero steps keeps the zoom") {
+        CHECK(TestableZoomer::ApplyWheelSteps(1.5f, 0) == doctest::Approx(1.5f));
+    }
+
+    SUBCASE("result is clamped") {
+        CHECK(TestableZoomer::ApplyWheelSteps(ZOOM_MAX, 1) == ZOOM_MAX);
+        CHECK(TestableZoomer::ApplyWheelSteps(ZOOM_MIN, -1) == ZOOM_MIN);
+    }
 }
 
 // ==================== Zoom clamping ====================

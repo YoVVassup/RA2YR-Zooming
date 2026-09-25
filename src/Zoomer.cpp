@@ -288,6 +288,44 @@ void Zoomer::ResetZoom()
 	LOG("Zoom reset to %.1f", ZOOM_DEFAULT);
 }
 
+bool Zoomer::CtrlHeld()
+{
+#ifdef VIEWCTRL_TEST
+	return g_ctrlHeld;
+#else
+	return (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+#endif
+}
+
+float Zoomer::ApplyWheelSteps(float zoom, int steps)
+{
+	if (steps == 0)
+		return zoom;
+
+	const float factor = powf(ZOOM_GEAR, (float)(steps > 0 ? steps : -steps));
+	if (steps > 0)
+		zoom *= factor;
+	else
+		zoom /= factor;
+
+	if (zoom > ZOOM_MAX) zoom = ZOOM_MAX;
+	if (zoom < ZOOM_MIN) zoom = ZOOM_MIN;
+	return zoom;
+}
+
+bool Zoomer::RegisterDoublePress(DWORD nowMs)
+{
+	if (g_haveLastPress && (nowMs - g_lastPressMs) <= DOUBLE_PRESS_MS)
+	{
+		g_haveLastPress = false;
+		return true;
+	}
+
+	g_lastPressMs = nowMs;
+	g_haveLastPress = true;
+	return false;
+}
+
 BOOL WINAPI Zoomer::HookedGetCursorPos(LPPOINT lpPoint)
 {
 	if (!OriginalGetCursorPos || !lpPoint)
@@ -325,7 +363,9 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 		LOG("MOUSEWHEEL: screen=(%ld,%ld) client=(%ld,%ld)", screenPt.x, screenPt.y, clientPt.x, clientPt.y);
 
-		if (IsPointInMapArea(clientPt))
+		// The magnified view zooms only while Ctrl is held (Telescope gates
+		// its wheel zoom the same way); otherwise the game sees the wheel.
+		if (CtrlHeld() && IsPointInMapArea(clientPt))
 		{
 			// The magnified view stays anchored at its center: the point under
 			// the cursor is kept in place by moving the game camera instead.
@@ -335,7 +375,8 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 			g_focusY = focus.y;
 			g_focusValid = true;
 
-			short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+			const short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+			const int steps = delta / WHEEL_DELTA;
 
 			if (g_useGScript && g_pZoomFactor)
 			{
@@ -343,46 +384,35 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 				if (curZoom < ZOOM_MIN) curZoom = ZOOM_MIN;
 				if (curZoom > ZOOM_MAX) curZoom = ZOOM_MAX;
 
-				if (delta > 0)
-					curZoom += ZOOM_STEP;
-				else
-					curZoom -= ZOOM_STEP;
-
-				if (curZoom < ZOOM_MIN) curZoom = ZOOM_MIN;
-				if (curZoom > ZOOM_MAX) curZoom = ZOOM_MAX;
-
+				curZoom = ApplyWheelSteps(curZoom, steps);
 				*g_pZoomFactor = curZoom;
 				LOG("GScript ZOOM: factor=%.3f", curZoom);
 			}
 			else
 			{
-				float target = g_targetZoom.load();
-				if (delta > 0)
-					target += ZOOM_STEP;
-				else
-					target -= ZOOM_STEP;
-
-				if (target > ZOOM_MAX) target = ZOOM_MAX;
-				if (target < ZOOM_MIN) target = ZOOM_MIN;
+				const float target = ApplyWheelSteps(g_targetZoom.load(), steps);
 				g_targetZoom.store(target);
 
-				LOG("WM_MOUSEWHEEL delta=%d target=%.3f", delta, target);
+				LOG("WM_MOUSEWHEEL delta=%d steps=%d target=%.3f", delta, steps, target);
 			}
+
+			return 0;
 		}
 
-		return 0;
+		return CallWindowProc(OriginalWndProc, hWnd, msg, wParam, lParam);
 	}
 
 	if (msg == WM_KEYDOWN)
 	{
-		bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
-		if (ctrl && wParam == VK_0)
+		// Double Alt press within DOUBLE_PRESS_MS resets the zoom; Alt itself
+		// is not consumed, the game still receives it.
+		if (wParam == VK_MENU && !(lParam & 0x40000000))
 		{
-			ResetZoom();
-			return 0;
+			if (RegisterDoublePress(GetTickCount()))
+				ResetZoom();
 		}
 
-		if (g_zoom.load() != ZOOM_DEFAULT && !ctrl)
+		if (g_zoom.load() != ZOOM_DEFAULT && !CtrlHeld())
 		{
 			const int viewW = g_viewRect.right - g_viewRect.left;
 			const int viewH = g_viewRect.bottom - g_viewRect.top;
