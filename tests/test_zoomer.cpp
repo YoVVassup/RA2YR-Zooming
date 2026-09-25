@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "../src/Zoomer.hpp"
+#include "../src/GameCamera.hpp"
 #include "../src/Log.h"
 #include "mock_ddraw.h"
 #include "mock_window.h"
@@ -86,6 +87,12 @@ public:
         g_invZoom.store(1.0f);
         g_centerX = 400;
         g_centerY = 300;
+        g_focusX = 0;
+        g_focusY = 0;
+        g_focusValid = false;
+        g_camOffset = { 0, 0 };
+        g_cameraBusy = false;
+        GameCamera::Disable();
         g_clientRect = { 0, 0, 1920, 1080 };
         g_clientWidth = 1920;
         g_clientHeight = 1080;
@@ -126,6 +133,10 @@ public:
     using Zoomer::UpdateCenter;
     using Zoomer::UpdateLerp;
     using Zoomer::UpdateLerpFrameIndependent;
+    using Zoomer::CommitZoom;
+    using Zoomer::ApplyCameraStep;
+    using Zoomer::UndoCameraOffset;
+    using Zoomer::PanCamera;
     using Zoomer::ResetZoom;
     using Zoomer::DetectDDrawWrapper;
     using Zoomer::UpdateMonitorInfo;
@@ -765,6 +776,27 @@ TEST_CASE("NewWndProc") {
         CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.0f));
     }
 
+    SUBCASE("WM_MOUSEWHEEL latches focus instead of moving the crop center") {
+        TestableZoomer::g_focusValid = false;
+        TestableZoomer::g_targetZoom.store(1.0f);
+        const LONG prevCenterX = TestableZoomer::g_centerX.load();
+        const LONG prevCenterY = TestableZoomer::g_centerY.load();
+
+        POINT screenPt = { 400, 300 };
+        POINT expected = screenPt;
+        ScreenToClient(win.hWnd, &expected);
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 120),
+                                   MAKELPARAM(screenPt.x, screenPt.y));
+
+        CHECK(TestableZoomer::g_focusValid);
+        CHECK(TestableZoomer::g_focusX.load() == expected.x);
+        CHECK(TestableZoomer::g_focusY.load() == expected.y);
+        CHECK(TestableZoomer::g_centerX.load() == prevCenterX);
+        CHECK(TestableZoomer::g_centerY.load() == prevCenterY);
+        CHECK(TestableZoomer::g_targetZoom.load() > 1.0f);
+    }
+
     SUBCASE("WM_SIZE updates cache") {
         int prevWidth = TestableZoomer::g_clientWidth;
         TestableZoomer::NewWndProc(win.hWnd, WM_SIZE, 0, 0);
@@ -1077,6 +1109,124 @@ TEST_CASE("ResetZoom") {
 
         CHECK(TestableZoomer::g_zoom.load() == ZOOM_DEFAULT);
         CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
+    }
+}
+
+// ==================== GameCamera::ComputeShift ====================
+
+TEST_CASE("GameCamera::ComputeShift") {
+    const POINT fixed = { 960, 540 };
+
+    SUBCASE("zoom in pushes the frame along the focus offset") {
+        POINT focus = { 1360, 540 };
+        POINT s = GameCamera::ComputeShift(focus, fixed, 1.0f, 2.0f);
+        CHECK(s.x == 200);
+        CHECK(s.y == 0);
+    }
+
+    SUBCASE("zoom out pulls the frame back") {
+        POINT focus = { 1360, 540 };
+        POINT s = GameCamera::ComputeShift(focus, fixed, 2.0f, 1.0f);
+        CHECK(s.x == -200);
+        CHECK(s.y == 0);
+    }
+
+    SUBCASE("focus on the anchor needs no movement") {
+        POINT s = GameCamera::ComputeShift(fixed, fixed, 1.0f, 3.0f);
+        CHECK(s.x == 0);
+        CHECK(s.y == 0);
+    }
+
+    SUBCASE("diagonal focus offsets shift both axes") {
+        POINT focus = { 1160, 340 };
+        POINT s = GameCamera::ComputeShift(focus, fixed, 1.0f, 2.0f);
+        CHECK(s.x == 100);
+        CHECK(s.y == -100);
+    }
+
+    SUBCASE("identical zoom levels do not move the camera") {
+        POINT focus = { 1360, 540 };
+        POINT s = GameCamera::ComputeShift(focus, fixed, 2.0f, 2.0f);
+        CHECK(s.x == 0);
+        CHECK(s.y == 0);
+    }
+
+    SUBCASE("non positive zoom factors are rejected") {
+        POINT focus = { 1360, 540 };
+        CHECK(GameCamera::ComputeShift(focus, fixed, 0.0f, 2.0f).x == 0);
+        CHECK(GameCamera::ComputeShift(focus, fixed, 1.0f, -1.0f).x == 0);
+    }
+
+    SUBCASE("zoom in and back out cancels out") {
+        POINT focus = { 1360, 240 };
+        POINT up = GameCamera::ComputeShift(focus, fixed, 1.0f, 1.7f);
+        POINT down = GameCamera::ComputeShift(focus, fixed, 1.7f, 1.0f);
+        CHECK(up.x + down.x == 0);
+        CHECK(up.y + down.y == 0);
+    }
+
+    SUBCASE("small steps round to whole pixels") {
+        POINT focus = { 1060, 540 };
+        POINT s = GameCamera::ComputeShift(focus, fixed, 1.0f, 1.05f);
+        CHECK(s.x == 5);
+    }
+}
+
+// ==================== CommitZoom / camera plumbing ====================
+
+TEST_CASE("CommitZoom") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("stores zoom and its inverse") {
+        TestableZoomer::CommitZoom(2.0f);
+
+        CHECK(TestableZoomer::g_zoom.load() == doctest::Approx(2.0f));
+        CHECK(TestableZoomer::g_invZoom.load() == doctest::Approx(0.5f));
+        CHECK(TestableZoomer::g_cameraBusy == false);
+    }
+
+    SUBCASE("nested lerp is ignored while the camera moves") {
+        TestableZoomer::g_cameraBusy = true;
+        TestableZoomer::g_zoom.store(1.0f);
+        TestableZoomer::g_targetZoom.store(2.0f);
+
+        TestableZoomer::UpdateLerp();
+
+        CHECK(TestableZoomer::g_zoom.load() == 1.0f);
+        TestableZoomer::g_cameraBusy = false;
+    }
+
+    SUBCASE("camera step does nothing when the game camera is unavailable") {
+        TestableZoomer::g_focusValid = true;
+        TestableZoomer::g_focusX = 800;
+        TestableZoomer::g_focusY = 540;
+
+        TestableZoomer::ApplyCameraStep(1.0f, 2.0f);
+
+        CHECK(TestableZoomer::g_camOffset.x == 0);
+        CHECK(TestableZoomer::g_camOffset.y == 0);
+    }
+
+    SUBCASE("zooming back to 1.0 drops the accumulated offset") {
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_invZoom.store(0.5f);
+        TestableZoomer::g_camOffset = { 40, -25 };
+
+        TestableZoomer::CommitZoom(1.0f);
+
+        CHECK(TestableZoomer::g_camOffset.x == 0);
+        CHECK(TestableZoomer::g_camOffset.y == 0);
+    }
+
+    SUBCASE("pan without a game camera moves the crop center") {
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_centerX = 400;
+        TestableZoomer::g_centerY = 300;
+
+        TestableZoomer::PanCamera(50, -20);
+
+        CHECK(TestableZoomer::g_centerX.load() == 450);
+        CHECK(TestableZoomer::g_centerY.load() == 280);
     }
 }
 

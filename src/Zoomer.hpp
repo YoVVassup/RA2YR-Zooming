@@ -65,6 +65,10 @@ private:
 	static void CALLBACK ZoomTimerProc(HWND hWnd, UINT msg, UINT_PTR idEvent, DWORD dwTime);
 	static void UpdateLerp();
 	static void UpdateLerpFrameIndependent();
+	static void CommitZoom(float newZoom);
+	static void ApplyCameraStep(float oldZoom, float newZoom);
+	static void UndoCameraOffset();
+	static void PanCamera(int dx, int dy);
 	static void ResetZoom();
 	static DDrawWrapper DetectDDrawWrapper();
 	static void UpdateMonitorInfo(HWND hWnd);
@@ -105,6 +109,20 @@ private:
 	static inline std::atomic<float> g_invZoom{ 1.0f };
 	static inline std::atomic<LONG> g_centerX{ 400 };
 	static inline std::atomic<LONG> g_centerY{ 300 };
+
+	// Screen point the next zoom step has to keep in place (latched per wheel
+	// event). The crop itself stays anchored at g_centerX/g_centerY.
+	static inline std::atomic<LONG> g_focusX{ 0 };
+	static inline std::atomic<LONG> g_focusY{ 0 };
+	static inline bool     g_focusValid = false;
+
+	// Cumulative camera shift applied by this plugin, in native screen pixels.
+	// Removed again as soon as the zoom factor returns to ZOOM_MIN.
+	static inline POINT    g_camOffset = { 0, 0 };
+
+	// True while the camera is being moved, so a repaint triggered from inside
+	// GameCamera::ShiftBy() cannot start another zoom step.
+	static inline bool     g_cameraBusy = false;
 
 	static inline WNDPROC  OriginalWndProc = nullptr;
 

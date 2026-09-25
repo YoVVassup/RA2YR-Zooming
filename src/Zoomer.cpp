@@ -1,4 +1,5 @@
 #include "Zoomer.hpp"
+#include "GameCamera.hpp"
 #include "Log.h"
 #include <windowsx.h>
 #include <GL/gl.h>
@@ -138,27 +139,28 @@ void Zoomer::ClampToViewport(POINT* pt)
 
 void Zoomer::UpdateLerp()
 {
+	if (g_cameraBusy) return;
+
 	float curZoom = g_zoom.load();
 	float tgtZoom = g_targetZoom.load();
+	if (curZoom == tgtZoom) return;
 
-	if (curZoom != tgtZoom)
+	float diff = tgtZoom - curZoom;
+	if (fabsf(diff) < ZOOM_SNAP)
 	{
-		float diff = tgtZoom - curZoom;
-		if (fabsf(diff) < ZOOM_SNAP)
-		{
-			curZoom = tgtZoom;
-		}
-		else
-		{
-			curZoom += diff * ZOOM_LERP;
-		}
-		g_zoom.store(curZoom);
-		g_invZoom.store(1.0f / curZoom);
+		curZoom = tgtZoom;
 	}
+	else
+	{
+		curZoom += diff * ZOOM_LERP;
+	}
+	CommitZoom(curZoom);
 }
 
 void Zoomer::UpdateLerpFrameIndependent()
 {
+	if (g_cameraBusy) return;
+
 	if (!g_perfCounterReady)
 	{
 		UpdateLerp();
@@ -175,29 +177,143 @@ void Zoomer::UpdateLerpFrameIndependent()
 
 	float curZoom = g_zoom.load();
 	float tgtZoom = g_targetZoom.load();
+	if (curZoom == tgtZoom) return;
 
-	if (curZoom != tgtZoom)
+	float diff = tgtZoom - curZoom;
+	if (fabsf(diff) < ZOOM_SNAP)
 	{
-		float diff = tgtZoom - curZoom;
-		if (fabsf(diff) < ZOOM_SNAP)
-		{
-			curZoom = tgtZoom;
-		}
-		else
-		{
-			float speed = 8.0f;
-			curZoom += diff * (1.0f - expf(-speed * dt));
-		}
-		g_zoom.store(curZoom);
-		g_invZoom.store(1.0f / curZoom);
+		curZoom = tgtZoom;
 	}
+	else
+	{
+		float speed = 8.0f;
+		curZoom += diff * (1.0f - expf(-speed * dt));
+	}
+	CommitZoom(curZoom);
+}
+
+void Zoomer::CommitZoom(float newZoom)
+{
+	const float oldZoom = g_zoom.load();
+	if (newZoom == oldZoom) return;
+
+	g_cameraBusy = true;
+	g_zoom.store(newZoom);
+	g_invZoom.store(1.0f / newZoom);
+
+	ApplyCameraStep(oldZoom, newZoom);
+
+	// Back at the native zoom the crop covers the whole view again, so the
+	// shift we accumulated while zoomed in is dropped here.
+	if (newZoom <= ZOOM_MIN && oldZoom > ZOOM_MIN)
+		UndoCameraOffset();
+
+	g_cameraBusy = false;
+}
+
+void Zoomer::ApplyCameraStep(float oldZoom, float newZoom)
+{
+	if (!GameCamera::IsEnabled()) return;
+	if (!(oldZoom > 0.0f) || oldZoom == newZoom) return;
+
+	POINT focus = { g_focusX.load(), g_focusY.load() };
+	if (!g_focusValid)
+	{
+		focus.x = g_centerX.load();
+		focus.y = g_centerY.load();
+	}
+
+	const POINT fixedPoint = { g_centerX.load(), g_centerY.load() };
+	const POINT shift = GameCamera::ComputeShift(focus, fixedPoint, oldZoom, newZoom);
+	if (shift.x == 0 && shift.y == 0) return;
+
+	if (GameCamera::ShiftBy(shift.x, shift.y))
+	{
+		g_camOffset.x += shift.x;
+		g_camOffset.y += shift.y;
+		LOG("camera shift (%ld,%ld) zoom %.3f -> %.3f offset (%ld,%ld) focus (%ld,%ld)",
+			shift.x, shift.y, oldZoom, newZoom,
+			g_camOffset.x, g_camOffset.y, focus.x, focus.y);
+	}
+	else
+	{
+		LOG("camera shift (%ld,%ld) rejected by the game", shift.x, shift.y);
+	}
+}
+
+void Zoomer::UndoCameraOffset()
+{
+	if (g_camOffset.x == 0 && g_camOffset.y == 0) return;
+
+	if (!GameCamera::IsEnabled())
+	{
+		g_camOffset = { 0, 0 };
+		return;
+	}
+
+	const bool wasBusy = g_cameraBusy;
+	g_cameraBusy = true;
+
+	if (GameCamera::ShiftBy(-g_camOffset.x, -g_camOffset.y))
+	{
+		LOG("camera offset undone (%ld,%ld)", g_camOffset.x, g_camOffset.y);
+		g_camOffset = { 0, 0 };
+	}
+	else
+	{
+		LOG("camera offset (%ld,%ld) could not be undone", g_camOffset.x, g_camOffset.y);
+	}
+
+	g_cameraBusy = wasBusy;
+}
+
+void Zoomer::PanCamera(int dx, int dy)
+{
+	if (dx == 0 && dy == 0) return;
+
+	if (GameCamera::IsEnabled())
+	{
+		const bool wasBusy = g_cameraBusy;
+		g_cameraBusy = true;
+		GameCamera::ShiftBy(dx, dy);
+		g_cameraBusy = wasBusy;
+		return;
+	}
+
+	// No game camera (outside gamemd.exe or GScript mode): pan the crop
+	// instead, which is what this plugin did before the camera existed.
+	int mapW = g_clientWidth - SIDEBAR_WIDTH;
+	int mapH = g_clientHeight - BOTTOM_BAR_HEIGHT;
+	if (mapW <= 0 || mapH <= 0) return;
+
+	const float curZoom = g_zoom.load();
+	const float visW = (float)mapW / curZoom;
+	const float visH = (float)mapH / curZoom;
+
+	float cx = (float)g_centerX.load() + (float)dx;
+	float cy = (float)g_centerY.load() + (float)dy;
+
+	const float halfW = visW * 0.5f;
+	const float halfH = visH * 0.5f;
+	if (cx < halfW) cx = halfW;
+	if (cy < halfH) cy = halfH;
+	if (cx > (float)mapW - halfW) cx = (float)mapW - halfW;
+	if (cy > (float)mapH - halfH) cy = (float)mapH - halfH;
+
+	g_centerX = (LONG)cx;
+	g_centerY = (LONG)cy;
 }
 
 void Zoomer::ResetZoom()
 {
+	g_cameraBusy = true;
 	g_zoom.store(ZOOM_DEFAULT);
 	g_targetZoom.store(ZOOM_DEFAULT);
 	g_invZoom.store(1.0f);
+	g_focusValid = false;
+	UndoCameraOffset();
+	g_cameraBusy = false;
+
 	LOG("Zoom reset to %.1f", ZOOM_DEFAULT);
 }
 
@@ -269,8 +385,11 @@ HRESULT WINAPI Zoomer::HookedBlt(
 	DWORD flags,
 	LPDDBLTFX fx)
 {
-	UpdateLerpFrameIndependent();
 	float curZoom = g_zoom.load();
+	// The zoom factor captured here is the one the currently visible frame was
+	// rendered with, so it has to be read *before* the step that moves the game
+	// camera — the camera move only shows up in the next frame.
+	UpdateLerpFrameIndependent();
 
 	bool isPrimary = IsPrimaryOrBackBuffer(self);
 	bool isMap = destRect ? IsMapArea(destRect) : false;
@@ -315,8 +434,11 @@ HRESULT WINAPI Zoomer::HookedFlip(
 	LPDIRECTDRAWSURFACE7 target,
 	DWORD flags)
 {
-	UpdateLerpFrameIndependent();
 	float curZoom = g_zoom.load();
+	// The zoom factor captured here is the one the currently visible frame was
+	// rendered with, so it has to be read *before* the step that moves the game
+	// camera — the camera move only shows up in the next frame.
+	UpdateLerpFrameIndependent();
 
 	bool isPrimary = IsPrimaryOrBackBuffer(self);
 
@@ -365,8 +487,11 @@ HRESULT WINAPI Zoomer::HookedBltFast(
 	LPRECT srcRect,
 	DWORD flags)
 {
-	UpdateLerpFrameIndependent();
 	float curZoom = g_zoom.load();
+	// The zoom factor captured here is the one the currently visible frame was
+	// rendered with, so it has to be read *before* the step that moves the game
+	// camera — the camera move only shows up in the next frame.
+	UpdateLerpFrameIndependent();
 
 	bool isPrimary = IsPrimaryOrBackBuffer(self);
 
@@ -437,8 +562,11 @@ BOOL WINAPI Zoomer::HookedBitBlt(
 	HDC hdc, int x, int y, int cx, int cy,
 	HDC hdcSrc, int x1, int y1, DWORD rop)
 {
-	UpdateLerpFrameIndependent();
 	float curZoom = g_zoom.load();
+	// The zoom factor captured here is the one the currently visible frame was
+	// rendered with, so it has to be read *before* the step that moves the game
+	// camera — the camera move only shows up in the next frame.
+	UpdateLerpFrameIndependent();
 
 	if (curZoom != ZOOM_DEFAULT && g_hWnd && hdc)
 	{
@@ -473,8 +601,11 @@ BOOL WINAPI Zoomer::HookedStretchBlt(
 	HDC hdcDest, int xDest, int yDest, int wDest, int hDest,
 	HDC hdcSrc, int xSrc, int ySrc, int wSrc, int hSrc, DWORD rop)
 {
-	UpdateLerpFrameIndependent();
 	float curZoom = g_zoom.load();
+	// The zoom factor captured here is the one the currently visible frame was
+	// rendered with, so it has to be read *before* the step that moves the game
+	// camera — the camera move only shows up in the next frame.
+	UpdateLerpFrameIndependent();
 
 	if (curZoom != ZOOM_DEFAULT && g_hWnd && hdcDest)
 	{
@@ -509,8 +640,11 @@ BOOL WINAPI Zoomer::HookedStretchBlt(
 
 BOOL WINAPI Zoomer::HookedSwapBuffers(HDC hdc)
 {
-	UpdateLerpFrameIndependent();
 	float curZoom = g_zoom.load();
+	// The zoom factor captured here is the one the currently visible frame was
+	// rendered with, so it has to be read *before* the step that moves the game
+	// camera — the camera move only shows up in the next frame.
+	UpdateLerpFrameIndependent();
 
 	if (curZoom != ZOOM_DEFAULT && g_openglAvailable)
 	{
@@ -619,8 +753,10 @@ HRESULT WINAPI Zoomer::HookedPresent(
 		goto pass_through;
 
 	{
-		UpdateLerpFrameIndependent();
 		float curZoom = g_zoom.load();
+		// Read the frame's zoom before advancing: the camera move it triggers
+		// only becomes visible in the next frame.
+		UpdateLerpFrameIndependent();
 
 		if (curZoom == ZOOM_DEFAULT)
 			goto pass_through;
@@ -796,8 +932,13 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 		if (IsPointInMapArea(clientPt))
 		{
-			g_centerX = clientPt.x;
-			g_centerY = clientPt.y;
+			// The crop stays anchored at the view center: the point under the
+			// cursor is kept in place by moving the game camera instead.
+			POINT focus = clientPt;
+			ClampToViewport(&focus);
+			g_focusX = focus.x;
+			g_focusY = focus.y;
+			g_focusValid = true;
 
 			short delta = GET_WHEEL_DELTA_WPARAM(wParam);
 
@@ -854,35 +995,23 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 			if (mapW > 0 && mapH > 0)
 			{
 				float curZoom = g_zoom.load();
-				float visW = (float)mapW / curZoom;
-				float visH = (float)mapH / curZoom;
-				float stepX = visW * 0.2f;
-				float stepY = visH * 0.2f;
-
-				float cx = (float)g_centerX.load();
-				float cy = (float)g_centerY.load();
-				bool handled = true;
+				int stepX = (int)((float)mapW / curZoom * 0.2f);
+				int stepY = (int)((float)mapH / curZoom * 0.2f);
+				int dx = 0;
+				int dy = 0;
 
 				switch (wParam)
 				{
-				case VK_LEFT:  cx -= stepX; break;
-				case VK_RIGHT: cx += stepX; break;
-				case VK_UP:    cy -= stepY; break;
-				case VK_DOWN:  cy += stepY; break;
-				default: handled = false; break;
+				case VK_LEFT:  dx = -stepX; break;
+				case VK_RIGHT: dx =  stepX; break;
+				case VK_UP:    dy = -stepY; break;
+				case VK_DOWN:  dy =  stepY; break;
+				default: break;
 				}
 
-				if (handled)
+				if (dx != 0 || dy != 0)
 				{
-					float halfW = visW * 0.5f;
-					float halfH = visH * 0.5f;
-					if (cx < halfW) cx = halfW;
-					if (cy < halfH) cy = halfH;
-					if (cx > (float)mapW - halfW) cx = (float)mapW - halfW;
-					if (cy > (float)mapH - halfH) cy = (float)mapH - halfH;
-
-					g_centerX = (LONG)cx;
-					g_centerY = (LONG)cy;
+					PanCamera(dx, dy);
 					return 0;
 				}
 			}
@@ -1178,6 +1307,15 @@ DWORD WINAPI Zoomer::InitThread(LPVOID lpParam)
 		LOG("GScript.ext not found — using D3D9 fallback mode");
 	}
 
+	if (g_useGScript)
+	{
+		LOG("GScript mode: game camera control stays disabled");
+	}
+	else
+	{
+		GameCamera::Enable();
+	}
+
 	ShowCursor(FALSE);
 	g_initialized = mhOk || (g_vtable != nullptr);
 	LOG("Init complete: g_initialized=%d useGScript=%d", g_initialized, g_useGScript);
@@ -1194,6 +1332,9 @@ void Zoomer::Init()
 void Zoomer::Shutdown()
 {
 	LOG("Shutdown() called");
+
+	UndoCameraOffset();
+	GameCamera::Disable();
 
 	if (g_hThread)
 	{

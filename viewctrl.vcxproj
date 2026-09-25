@@ -117,6 +117,7 @@
   <ItemGroup>
     <ClInclude Include="src\Main.hpp" />
     <ClInclude Include="src\Zoomer.hpp" />
+    <ClInclude Include="src\GameCamera.hpp" />
     <ClInclude Include="src\Log.h" />
     <ClInclude Include="MinHook\include\MinHook.h" />
     <ClInclude Include="YRpp\Helpers\Cast.h" />
@@ -133,6 +134,7 @@
   <ItemGroup>
     <ClCompile Include="src\Main.cpp" />
     <ClCompile Include="src\Zoomer.cpp" />
+    <ClCompile Include="src\GameCamera.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\ViewCtrl.rc" />
