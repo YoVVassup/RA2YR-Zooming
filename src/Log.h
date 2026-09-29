@@ -2,6 +2,8 @@
 
 #include <windows.h>
 #include <cstdio>
+#include <cstdarg>
+#include <cstring>
 
 namespace Debug
 {
@@ -51,4 +53,10 @@ namespace Debug
     }
 }
 
+// Release builds compile logging out entirely: no ViewCtrl.log is ever
+// created next to the game. Debug builds keep the file for troubleshooting.
+#ifdef NDEBUG
+#define LOG(fmt, ...) ((void)0)
+#else
 #define LOG(fmt, ...) Debug::Log("[ViewCtrl] " fmt "\n", ##__VA_ARGS__)
+#endif

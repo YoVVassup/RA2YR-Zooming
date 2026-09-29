@@ -2,6 +2,7 @@
 Debug/
 Release/
 x64/
+obj/
 *.exe
 *.dll
 *.lib
@@ -11,6 +12,7 @@ x64/
 *.obj
 *.o
 *.res
+*.log
 
 # Visual Studio
 *.suo

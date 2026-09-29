@@ -5,12 +5,22 @@
 #include "doctest.h"
 #include <vector>
 #include <cstring>
+#include <string>
 
 #include "../src/Zoomer.hpp"
 #include "../src/RenderZoom.hpp"
 #include "../src/GameCamera.hpp"
+#include "../src/GameAddrs.hpp"
+#include "../src/ScalerConflict.hpp"
 #include "../src/Log.h"
 #include "mock_window.h"
+
+// Main.cpp test seam: the sidebar flag byte the PostRender hook reads.
+void SetFlagByteForTest(const BYTE* p);
+
+// DllMain lives in Main.cpp, which the test project links; call it directly
+// to cover the process attach/detach paths.
+extern BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved);
 
 static UINT   g_recordedMsg = 0;
 static LPARAM g_recordedLParam = 0;
@@ -43,6 +53,9 @@ public:
         g_camOffset = { 0, 0 };
         g_cameraBusy = false;
         GameCamera::Disable();
+        GameCamera::SetCameraPositionForTest(nullptr);
+        GameCamera::SetTacticalInstanceForTest(nullptr);
+        SetFlagByteForTest(nullptr);
         g_clientRect = { 0, 0, 1920, 1080 };
         g_clientWidth = 1920;
         g_clientHeight = 1080;
@@ -54,14 +67,15 @@ public:
         g_perfCounterReady = false;
         g_lastLerpTime = {};
         g_perfFrequency = {};
-        g_useGScript = false;
-        g_pZoomFactor = nullptr;
         g_ctrlHeld = false;
         g_haveLastPress = false;
         g_lastPressMs = 0;
+        g_wheelRemainder = 0;
+        g_initStarted = false;
         g_recordedMsg = 0;
         g_recordedLParam = 0;
         if (g_hThread) { CloseHandle(g_hThread); g_hThread = nullptr; }
+        RenderZoom::SetTestGameRegion(nullptr, nullptr, nullptr, nullptr);
         RenderZoom::ResetFrameState();
         RenderZoom::SetEnabled(false);
     }
@@ -150,7 +164,7 @@ TEST_CASE("ClampToViewport") {
     SUBCASE("point right of the view rect") {
         POINT pt = { 2000, 500 };
         TestableZoomer::ClampToViewport(&pt);
-        CHECK(pt.x == 800);
+        CHECK(pt.x == 799);
     }
 
     SUBCASE("point above the view rect") {
@@ -162,7 +176,15 @@ TEST_CASE("ClampToViewport") {
     SUBCASE("point below the view rect") {
         POINT pt = { 500, 2000 };
         TestableZoomer::ClampToViewport(&pt);
-        CHECK(pt.y == 600);
+        CHECK(pt.y == 599);
+    }
+
+    SUBCASE("a clamped point is inside the view rect") {
+        POINT corners[4] = { { -100, -100 }, { 2000, -100 }, { -100, 2000 }, { 2000, 2000 } };
+        for (auto& pt : corners) {
+            TestableZoomer::ClampToViewport(&pt);
+            CHECK(TestableZoomer::IsPointInMapArea(pt) == true);
+        }
     }
 
     SUBCASE("view rect with an offset origin") {
@@ -175,8 +197,9 @@ TEST_CASE("ClampToViewport") {
 
         POINT after = { 1000, 1000 };
         TestableZoomer::ClampToViewport(&after);
-        CHECK(after.x == 900);
-        CHECK(after.y == 650);
+        CHECK(after.x == 899);
+        CHECK(after.y == 649);
+        CHECK(TestableZoomer::IsPointInMapArea(after) == true);
     }
 
     SUBCASE("null point") {
@@ -432,6 +455,50 @@ TEST_CASE("NewWndProc") {
         CHECK(!TestableZoomer::g_focusValid);
     }
 
+    SUBCASE("partial wheel steps add up to a full one") {
+        TestableZoomer::g_ctrlHeld = true;
+        TestableZoomer::g_targetZoom.store(1.0f);
+        LPARAM lParam = MAKELPARAM(400, 300);
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 40), lParam);
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.0f));
+        CHECK(TestableZoomer::g_wheelRemainder == 40);
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 40), lParam);
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.0f));
+        CHECK(TestableZoomer::g_wheelRemainder == 80);
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 40), lParam);
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(ZOOM_GEAR));
+        CHECK(TestableZoomer::g_wheelRemainder == 0);
+    }
+
+    SUBCASE("negative partial wheel steps add up too") {
+        TestableZoomer::g_ctrlHeld = true;
+        TestableZoomer::g_targetZoom.store(1.5f);
+        LPARAM lParam = MAKELPARAM(400, 300);
+
+        for (int i = 0; i < 3; ++i)
+            TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, -40), lParam);
+
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.5f / ZOOM_GEAR));
+        CHECK(TestableZoomer::g_wheelRemainder == 0);
+    }
+
+    SUBCASE("a wheel that goes to the game drops the remainder") {
+        TestableZoomer::g_ctrlHeld = true;
+        TestableZoomer::g_targetZoom.store(1.0f);
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 40),
+                                   MAKELPARAM(400, 300));
+        REQUIRE(TestableZoomer::g_wheelRemainder == 40);
+
+        TestableZoomer::g_ctrlHeld = false;
+        TestableZoomer::NewWndProc(win.hWnd, WM_MOUSEWHEEL, MAKEWPARAM(0, 40),
+                                   MAKELPARAM(400, 300));
+        CHECK(TestableZoomer::g_wheelRemainder == 0);
+        CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(1.0f));
+    }
+
     SUBCASE("WM_MOUSEWHEEL clamps to MAX") {
         TestableZoomer::g_ctrlHeld = true;
         TestableZoomer::g_targetZoom.store(3.95f);
@@ -505,6 +572,45 @@ TEST_CASE("NewWndProc") {
         CHECK(TestableZoomer::g_centerX.load() == prevX + stepX);
     }
 
+    SUBCASE("arrow keys at zoom 1.0 pass through") {
+        TestableZoomer::g_zoom.store(ZOOM_DEFAULT);
+        TestableZoomer::g_targetZoom.store(ZOOM_DEFAULT);
+        const LONG prevX = TestableZoomer::g_centerX.load();
+        g_recordedMsg = 0;
+
+        LRESULT result = TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_RIGHT, 0);
+
+        CHECK(result == 0);
+        CHECK(g_recordedMsg == WM_KEYDOWN);
+        CHECK(TestableZoomer::g_centerX.load() == prevX);
+    }
+
+    SUBCASE("arrow keys inside the snap epsilon do not pan") {
+        const float barelyZoomed = ZOOM_DEFAULT + ZOOM_SNAP * 0.5f;
+        TestableZoomer::g_zoom.store(barelyZoomed);
+        TestableZoomer::g_targetZoom.store(barelyZoomed);
+        const LONG prevX = TestableZoomer::g_centerX.load();
+        g_recordedMsg = 0;
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_RIGHT, 0);
+
+        CHECK(g_recordedMsg == WM_KEYDOWN);
+        CHECK(TestableZoomer::g_centerX.load() == prevX);
+    }
+
+    SUBCASE("arrow keys while Ctrl is held pass through") {
+        TestableZoomer::g_zoom.store(2.0f);
+        TestableZoomer::g_targetZoom.store(2.0f);
+        TestableZoomer::g_ctrlHeld = true;
+        const LONG prevX = TestableZoomer::g_centerX.load();
+        g_recordedMsg = 0;
+
+        TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_RIGHT, 0);
+
+        CHECK(g_recordedMsg == WM_KEYDOWN);
+        CHECK(TestableZoomer::g_centerX.load() == prevX);
+    }
+
     SUBCASE("mouse messages pass through untouched even when zoomed") {
         TestableZoomer::g_zoom.store(2.0f);
         TestableZoomer::g_targetZoom.store(2.0f);
@@ -568,7 +674,7 @@ TEST_CASE("Double Ctrl reset") {
         CHECK(TestableZoomer::g_targetZoom.load() == doctest::Approx(ZOOM_DEFAULT));
     }
 
-    SUBCASE("system key messages do not reset - telescope watches WM_KEYDOWN") {
+    SUBCASE("system key messages do not reset - only WM_KEYDOWN counts") {
         TestableZoomer::g_zoom.store(2.5f);
         TestableZoomer::g_targetZoom.store(2.8f);
 
@@ -844,6 +950,8 @@ TEST_CASE("Shutdown") {
         TestableZoomer::g_targetZoom.store(1.8f);
         TestableZoomer::g_invZoom.store(0.666f);
         TestableZoomer::g_initialized = true;
+        TestableZoomer::g_initStarted = true;
+        TestableZoomer::g_wheelRemainder = 80;
 
         TestableZoomer::Shutdown();
 
@@ -851,6 +959,8 @@ TEST_CASE("Shutdown") {
         CHECK(TestableZoomer::g_targetZoom.load() == ZOOM_DEFAULT);
         CHECK(TestableZoomer::g_invZoom.load() == 1.0f);
         CHECK(TestableZoomer::g_initialized == false);
+        CHECK(TestableZoomer::g_initStarted == false);
+        CHECK(TestableZoomer::g_wheelRemainder == 0);
     }
 
     SUBCASE("restores the window proc if hooked") {
@@ -879,6 +989,22 @@ TEST_CASE("Shutdown") {
     }
 }
 
+// ==================== Init ====================
+
+TEST_CASE("Init") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("a second call does not start another thread") {
+        TestableZoomer::g_initStarted = true;
+        TestableZoomer::g_hThread = nullptr;
+
+        TestableZoomer::Init();
+
+        CHECK(TestableZoomer::g_hThread == nullptr);
+        CHECK(TestableZoomer::g_initStarted == true);
+    }
+}
+
 // ==================== Constants ====================
 
 TEST_CASE("Constants") {
@@ -889,7 +1015,12 @@ TEST_CASE("Constants") {
     CHECK(ZOOM_LERP == doctest::Approx(0.15f));
     CHECK(ZOOM_SNAP == doctest::Approx(0.001f));
     CHECK(DOUBLE_PRESS_MS == 400);
-    CHECK(GSCRIPT_ZOOM_FACTOR_RVA == 0x1739B0);
+    // Cross-checked against YRpp / ReSource / Encyclopedia (GameAddrs.hpp).
+    CHECK(GameAddr::DSurface_ViewBounds == 0x886FA0);
+    CHECK(GameAddr::DSurface_WindowBounds == 0x886FB0);
+    CHECK(GameAddr::DSurface_Composite == 0x88731C);
+    CHECK(GameAddr::ClampCoordMap == 0x6D8640);
+    CHECK(GameAddr::TacticalMapClass_SetCameraPosition == 0x6D6000);
 }
 
 // ==================== ApplyWheelSteps ====================
@@ -1192,6 +1323,15 @@ TEST_CASE("RenderZoom::CopyRows") {
         CHECK(RenderZoom::CopyRows(surf.data(), 6, view, backup.data(), 4, 2, true) == false);
     }
 
+    SUBCASE("a pitch that cannot hold the offset view is rejected") {
+        std::vector<unsigned char> surf = makeSurface();
+        std::vector<unsigned char> backup(16, 0);
+        // 4 pixels wide starting at column 2 need 12 bytes of every row,
+        // a pitch of 10 only holds up to column 4.
+        CHECK(RenderZoom::CopyRows(surf.data(), 10, view, backup.data(), 4, 2, true) == false);
+        CHECK(RenderZoom::CopyRows(surf.data(), 12, view, backup.data(), 4, 2, true) == true);
+    }
+
     SUBCASE("an inverted view is rejected") {
         std::vector<unsigned char> surf = makeSurface();
         std::vector<unsigned char> backup(16, 0);
@@ -1308,9 +1448,12 @@ TEST_CASE("RenderZoom::ClampDimension") {
         CHECK(RenderZoom::ClampDimension(640, -1, true) == 640);
     }
 
-    SUBCASE("outside the game there is no dimension to read") {
-        CHECK(RenderZoom::ClampWidth() == 0);
-        CHECK(RenderZoom::ClampHeight() == 0);
+    SUBCASE("outside the game the vanilla view size stands in") {
+        // Unreadable globals fall back to the last value seen, seeded with
+        // the 640x400 the game writes at init - not 0, which would pin
+        // ClampCoordMap at the map origin.
+        CHECK(RenderZoom::ClampWidth() == 640);
+        CHECK(RenderZoom::ClampHeight() == 400);
     }
 }
 
@@ -1331,3 +1474,1140 @@ TEST_CASE("Zoomer::DefaultViewRect") {
         CHECK(TestableZoomer::g_viewRectFromGame == false);
     }
 }
+
+// ==================== Syringe hook bodies ====================
+// Main.cpp compiles into this test binary (test.vcxproj): the DEFINE_HOOK
+// bodies are plain extern "C" functions driven through Syringe's REGISTERS,
+// with the game globals redirected at a fake region (SetTestGameRegion).
+
+#ifndef SYR_VER
+#define SYR_VER 2
+#endif
+#include <Helpers/Macro.h>
+
+extern "C" DWORD __cdecl GameInt(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlPreRenderRestore(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlPostRenderZoom(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlClampWidth(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlClampHeight(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlProcessClickCoords(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlDragBandStart(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlDragBandEnd(REGISTERS* R);
+extern "C" DWORD __cdecl ViewCtrlRightDragSpeed(REGISTERS* R);
+
+#include <new>
+
+namespace
+{
+    // 16 bit surface standing in for DSurface::Composite; the vtable slots are
+    // the ones RenderZoom::LockView looks up (YRpp Surface.h).
+    struct FakeSurface
+    {
+        void** vptr = nullptr;
+        int width = 0;
+        int height = 0;
+        int pitch = 0;
+        unsigned short* pixels = nullptr;
+        int bpp = 2;
+        int locks = 0;
+
+        int GetBytesPerPixel() { return bpp; }
+        int GetPitch() { return pitch; }
+        int GetWidth() { return width; }
+        int GetHeight() { return height; }
+        void* Lock(int, int) { ++locks; return pixels; }
+        bool Unlock() { --locks; return true; }
+    };
+
+    template<typename M>
+    void* PmfToPtr(M m)
+    {
+        static_assert(sizeof(M) == sizeof(void*));
+        void* p = nullptr;
+        memcpy(&p, &m, sizeof p);
+        return p;
+    }
+
+    // One VirtualAlloc'd region hosts everything IsGameReadable checks: the
+    // module base override has to cover the global slots, the fake objects
+    // and the pixel backing store.
+    class FakeGameRegion
+    {
+    public:
+        static constexpr SIZE_T kSize = 2 * 1024 * 1024;
+
+        BYTE* base = nullptr;
+        void** compositeSlot = nullptr;
+        int* viewBounds = nullptr;
+        int* windowBounds = nullptr;
+        BYTE* dragObj = nullptr;
+        void** vtable = nullptr;
+        FakeSurface* surface = nullptr;
+        unsigned short* pixels = nullptr;
+
+        bool Create(int surfW = 800, int surfH = 600)
+        {
+            base = static_cast<BYTE*>(VirtualAlloc(
+                nullptr, kSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            if (!base) return false;
+
+            compositeSlot = reinterpret_cast<void**>(base + 0x10);
+            viewBounds = reinterpret_cast<int*>(base + 0x100);
+            windowBounds = reinterpret_cast<int*>(base + 0x110);
+            dragObj = base + 0x200;
+            vtable = reinterpret_cast<void**>(base + 0x8000);
+            pixels = reinterpret_cast<unsigned short*>(base + 0x10000);
+
+            memset(vtable, 0, 33 * sizeof(void*));
+            vtable[23] = PmfToPtr(&FakeSurface::Lock);
+            vtable[24] = PmfToPtr(&FakeSurface::Unlock);
+            vtable[28] = PmfToPtr(&FakeSurface::GetBytesPerPixel);
+            vtable[29] = PmfToPtr(&FakeSurface::GetPitch);
+            vtable[31] = PmfToPtr(&FakeSurface::GetWidth);
+            vtable[32] = PmfToPtr(&FakeSurface::GetHeight);
+
+            surface = new (base + 0x8100) FakeSurface;
+            surface->vptr = vtable;
+            surface->width = surfW;
+            surface->height = surfH;
+            surface->pitch = surfW * 2;
+            surface->pixels = pixels;
+            *compositeSlot = surface;
+
+            SetView(0, 0, 640, 400);
+            SetWindow(0, 0, surfW, surfH);
+
+            RenderZoom::SetTestGameRegion(base, compositeSlot, viewBounds, windowBounds);
+            return true;
+        }
+
+        void SetView(int x, int y, int w, int h)
+        {
+            viewBounds[0] = x; viewBounds[1] = y;
+            viewBounds[2] = w; viewBounds[3] = h;
+        }
+
+        void SetWindow(int x, int y, int w, int h)
+        {
+            windowBounds[0] = x; windowBounds[1] = y;
+            windowBounds[2] = w; windowBounds[3] = h;
+        }
+
+        static unsigned short PatternAt(int x, int y)
+        {
+            return static_cast<unsigned short>((x * 31 + y * 17) & 0xFFFF);
+        }
+
+        void FillPattern()
+        {
+            for (int y = 0; y < surface->height; ++y)
+                for (int x = 0; x < surface->width; ++x)
+                    pixels[y * surface->width + x] = PatternAt(x, y);
+        }
+
+        unsigned short At(int x, int y) const
+        {
+            return pixels[y * surface->width + x];
+        }
+
+        void Destroy()
+        {
+            RenderZoom::SetTestGameRegion(nullptr, nullptr, nullptr, nullptr);
+            if (base) { VirtualFree(base, 0, MEM_RELEASE); base = nullptr; }
+        }
+
+        ~FakeGameRegion() { Destroy(); }
+    };
+}
+
+TEST_CASE("Hook: ViewCtrlPreRenderRestore") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(false);
+
+    SUBCASE("the stolen EAX is replayed with setne cl") {
+        REGISTERS R{};
+        R.EAX(0u);
+        CHECK(ViewCtrlPreRenderRestore(&R) == 0x4F44B4);
+        CHECK(R.EAX() == 0u);
+        CHECK(R.CL() == 0u);
+
+        R.EAX(7u);
+        CHECK(ViewCtrlPreRenderRestore(&R) == 0x4F44B4);
+        CHECK(R.EAX() == 7u);
+        CHECK(R.CL() == 1u);
+    }
+
+    SUBCASE("a backup that cannot be restored forces EAX=2") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(400, 300));
+        game.FillPattern();
+        Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        RenderZoom::SetEnabled(true);
+        RenderZoom::PostRender();
+        REQUIRE(game.surface->locks == 0);
+
+        // Take the surface away: the restore fails and the frame is declared
+        // dirty even though the pixels were never put back.
+        RenderZoom::SetTestGameRegion(nullptr, nullptr, nullptr, nullptr);
+
+        REGISTERS R{};
+        R.EAX(5u);
+        CHECK(ViewCtrlPreRenderRestore(&R) == 0x4F44B4);
+        CHECK(R.EAX() == 2u);
+        CHECK(R.CL() == 1u);
+    }
+}
+
+
+TEST_CASE("Hook: ViewCtrlPostRenderZoom") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(false);
+
+    // In the game the flag byte is the fixed address 0xB0B519; in the test
+    // process that address can belong to a DLL image (ASLR), so the hook
+    // reads through SetFlagByteForTest instead.
+    BYTE flagByte = 0;
+    SetFlagByteForTest(&flagByte);
+
+    SUBCASE("the sidebar flag byte replaces AL") {
+        flagByte = 0x5A;
+        REGISTERS R{};
+        R.EAX(0x11223300u);
+        CHECK(ViewCtrlPostRenderZoom(&R) == 0x4F4520);
+        CHECK(R.EAX() == 0x1122335Au);
+    }
+
+    SUBCASE("a cleared flag yields AL=0") {
+        flagByte = 0x00;
+        REGISTERS R{};
+        R.EAX(0xFFFFFFFFu);
+        CHECK(ViewCtrlPostRenderZoom(&R) == 0x4F4520);
+        CHECK(R.EAX() == 0xFFFFFF00u);
+    }
+
+    SetFlagByteForTest(nullptr);
+}
+
+TEST_CASE("Hook: ViewCtrlClampWidth / ViewCtrlClampHeight") {
+    TestableZoomer::ResetState();
+
+    SUBCASE("outside the game the 640x400 seed stands in") {
+        REGISTERS R{};
+        CHECK(ViewCtrlClampWidth(&R) == 0x6D8654);
+        CHECK(R.EBX() == 640u);
+        CHECK(ViewCtrlClampHeight(&R) == 0x6D8690);
+        CHECK(R.EBX() == 400u);
+    }
+
+    SUBCASE("while magnified the source rect size is clamped against") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(800, 600));
+        game.SetView(0, 0, 640, 400);
+        game.SetWindow(0, 0, 800, 600);
+        Zoomer::SetViewRect({ 0, 0, 640, 400 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        REQUIRE(RenderZoom::AcceptViewRect({ 0, 0, 640, 400 }, GetTickCount()));
+
+        const RenderZoom::SourceRect expect =
+            RenderZoom::ComputeSourceRect(640, 400, 320, 200, 2.0f);
+
+        REGISTERS R{};
+        CHECK(ViewCtrlClampWidth(&R) == 0x6D8654);
+        CHECK(R.EBX() == static_cast<DWORD>(expect.W));
+        CHECK(ViewCtrlClampHeight(&R) == 0x6D8690);
+        CHECK(R.EBX() == static_cast<DWORD>(expect.H));
+
+        Zoomer::g_zoom.store(1.0f);
+        Zoomer::g_targetZoom.store(1.0f);
+        CHECK(ViewCtrlClampWidth(&R) == 0x6D8654);
+        CHECK(R.EBX() == 640u);
+    }
+}
+
+TEST_CASE("Hook: ViewCtrlProcessClickCoords") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(false);
+
+    BYTE stack[0x80] = {};
+    REGISTERS R{};
+    R.ESP(reinterpret_cast<DWORD>(&stack[0]));
+
+    SUBCASE("without an active zoom the point passes through") {
+        POINT pt = { 100, 150 };
+        *reinterpret_cast<POINT**>(&stack[0x28]) = &pt;
+        R.EAX(0x1234u);
+        R.EDX(0u);
+
+        CHECK(ViewCtrlProcessClickCoords(&R) == 0x69232B);
+        CHECK(R.EBP() == reinterpret_cast<DWORD>(&pt));
+        CHECK(R.EAX() == 0x1234u);
+    }
+
+    SUBCASE("an active zoom un-magnifies the point") {
+        Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+
+        POINT pt = { 0, 0 }; // the view origin maps to the source origin
+        *reinterpret_cast<POINT**>(&stack[0x28]) = &pt;
+        R.EDX(0u);
+
+        CHECK(ViewCtrlProcessClickCoords(&R) == 0x69232B);
+        const POINT* got = reinterpret_cast<const POINT*>(R.EBP());
+        CHECK(got != &pt);
+        CHECK(got->x == 100);
+        CHECK(got->y == 75);
+    }
+
+    SUBCASE("the optional out pointer receives EAX") {
+        POINT pt = { 10, 10 };
+        *reinterpret_cast<POINT**>(&stack[0x28]) = &pt;
+        DWORD outValue = 0;
+        R.EAX(0xABCDu);
+        R.EDX(reinterpret_cast<DWORD>(&outValue));
+
+        CHECK(ViewCtrlProcessClickCoords(&R) == 0x69232B);
+        CHECK(outValue == 0xABCDu);
+        CHECK(R.EBP() == reinterpret_cast<DWORD>(&pt));
+    }
+
+    SUBCASE("a null stack point yields a null EBP") {
+        *reinterpret_cast<POINT**>(&stack[0x28]) = nullptr;
+        CHECK(ViewCtrlProcessClickCoords(&R) == 0x69232B);
+        CHECK(R.EBP() == 0u);
+    }
+}
+
+TEST_CASE("Hook: ViewCtrlDragBandStart / End") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(false);
+
+    BYTE stack[0x40] = {};
+    BYTE obj[0x1000] = {};
+    memset(obj, 0, sizeof obj);
+    *reinterpret_cast<DWORD*>(obj + 0xD90) = 0x00C0FFEEu;
+
+    REGISTERS R{};
+    R.ESP(reinterpret_cast<DWORD>(&stack[0]));
+    R.ECX(reinterpret_cast<DWORD>(obj));
+
+    SUBCASE("start: an inactive zoom keeps the stack point") {
+        POINT pt = { 50, 60 };
+        *reinterpret_cast<POINT**>(&stack[4]) = &pt;
+
+        CHECK(ViewCtrlDragBandStart(&R) == 0x6D9F86);
+        CHECK(R.EAX() == 0x00C0FFEEu);
+        CHECK(*reinterpret_cast<POINT**>(&stack[4]) == &pt);
+    }
+
+    SUBCASE("start: an active zoom rewrites the stack point") {
+        Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        POINT pt = { 0, 0 };
+        *reinterpret_cast<POINT**>(&stack[4]) = &pt;
+
+        CHECK(ViewCtrlDragBandStart(&R) == 0x6D9F86);
+        const POINT* got = *reinterpret_cast<POINT**>(&stack[4]);
+        CHECK(got != &pt);
+        CHECK(got->x == 100);
+        CHECK(got->y == 75);
+        CHECK(R.EAX() == 0x00C0FFEEu);
+    }
+
+    SUBCASE("start: a null this pointer reads EAX=0") {
+        POINT pt = { 50, 60 };
+        *reinterpret_cast<POINT**>(&stack[4]) = &pt;
+        R.ECX(0u);
+
+        CHECK(ViewCtrlDragBandStart(&R) == 0x6D9F86);
+        CHECK(R.EAX() == 0u);
+    }
+
+    SUBCASE("end: an active zoom rewrites the stack point") {
+        Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        POINT pt = { 0, 0 };
+        *reinterpret_cast<POINT**>(&stack[4]) = &pt;
+
+        CHECK(ViewCtrlDragBandEnd(&R) == 0x6D9FC6);
+        const POINT* got = *reinterpret_cast<POINT**>(&stack[4]);
+        CHECK(got != &pt);
+        CHECK(got->x == 100);
+        CHECK(got->y == 75);
+        CHECK(R.EAX() == 0x00C0FFEEu);
+    }
+
+    SUBCASE("end: a null stack point leaves the slot alone") {
+        *reinterpret_cast<POINT**>(&stack[4]) = nullptr;
+
+        CHECK(ViewCtrlDragBandEnd(&R) == 0x6D9FC6);
+        CHECK(*reinterpret_cast<POINT**>(&stack[4]) == nullptr);
+        CHECK(R.EAX() == 0x00C0FFEEu);
+    }
+}
+
+TEST_CASE("Hook: ViewCtrlRightDragSpeed") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(false);
+
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600));
+
+    BYTE* obj = game.dragObj;
+    BYTE stack[0x40] = {};
+    int* speedX = reinterpret_cast<int*>(&stack[0x18]);
+    int* speedY = reinterpret_cast<int*>(&stack[0x1C]);
+
+    REGISTERS R{};
+    R.ESP(reinterpret_cast<DWORD>(&stack[0]));
+    R.EBX(reinterpret_cast<DWORD>(obj));
+
+    Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+
+    SUBCASE("an active zoom scales both positive speeds down") {
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        obj[0x5558] = 1;
+        *speedX = 10; *speedY = 6;
+
+        CHECK(ViewCtrlRightDragSpeed(&R) == 0x693797);
+        CHECK(*speedX == 5);
+        CHECK(*speedY == 3);
+        CHECK(R.ESI() == 0u);
+        CHECK(*reinterpret_cast<DWORD*>(&stack[0x28]) == 0u);
+    }
+
+    SUBCASE("the drag flag off leaves the speeds alone") {
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        obj[0x5558] = 0;
+        *speedX = 10; *speedY = 6;
+
+        ViewCtrlRightDragSpeed(&R);
+        CHECK(*speedX == 10);
+        CHECK(*speedY == 6);
+    }
+
+    SUBCASE("without an active zoom the speeds stay untouched") {
+        Zoomer::g_zoom.store(1.0f);
+        Zoomer::g_targetZoom.store(1.0f);
+        obj[0x5558] = 1;
+        *speedX = 10; *speedY = 6;
+
+        ViewCtrlRightDragSpeed(&R);
+        CHECK(*speedX == 10);
+        CHECK(*speedY == 6);
+    }
+
+    SUBCASE("negative speeds are not scaled") {
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        obj[0x5558] = 1;
+        *speedX = -8; *speedY = -6;
+
+        ViewCtrlRightDragSpeed(&R);
+        CHECK(*speedX == -8);
+        CHECK(*speedY == -6);
+    }
+
+    SUBCASE("a null object still zeroes ESI and the stack slot") {
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+        obj[0x5558] = 1;
+        *speedX = 10; *speedY = 6;
+        R.EBX(0u);
+
+        CHECK(ViewCtrlRightDragSpeed(&R) == 0x693797);
+        CHECK(*speedX == 10);
+        CHECK(R.ESI() == 0u);
+    }
+}
+
+// ==================== Render pipeline against a fake game ====================
+
+TEST_CASE("RenderZoom: observes the game view rect through the fake region") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+
+    SUBCASE("view bounds smaller than the window are published") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(800, 600));
+        game.SetView(10, 20, 640, 400);
+        game.SetWindow(0, 0, 800, 600);
+
+        CHECK(RenderZoom::PreRender() == false);
+        CHECK(SameRect(Zoomer::ViewRect(), RECT{ 10, 20, 650, 420 }));
+    }
+
+    SUBCASE("a view rect equal to the window is ignored") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(800, 600));
+        game.SetView(0, 0, 800, 600);
+        game.SetWindow(0, 0, 800, 600);
+        Zoomer::SetViewRect({ 0, 0, 640, 400 }, true);
+
+        CHECK(RenderZoom::PreRender() == false);
+        CHECK(SameRect(Zoomer::ViewRect(), RECT{ 0, 0, 640, 400 }));
+    }
+}
+
+TEST_CASE("RenderZoom: PostRender magnifies, PreRender restores") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600));
+    game.FillPattern();
+    Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+    Zoomer::g_zoom.store(2.0f);
+    Zoomer::g_targetZoom.store(2.0f);
+
+    RenderZoom::PostRender();
+    REQUIRE(game.surface->locks == 0);
+
+    const RenderZoom::SourceRect src =
+        RenderZoom::ComputeSourceRect(400, 300, 200, 150, 2.0f);
+
+    SUBCASE("the view rect holds the magnified source pixels") {
+        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(src.X, src.Y));
+        CHECK(game.At(399, 299) ==
+            FakeGameRegion::PatternAt(src.X + src.W - 1, src.Y + src.H - 1));
+        // The anchor maps onto itself.
+        CHECK(game.At(200, 150) == FakeGameRegion::PatternAt(200, 150));
+    }
+
+    SUBCASE("pixels outside the view rect stay untouched") {
+        CHECK(game.At(50, 400) == FakeGameRegion::PatternAt(50, 400));
+        CHECK(game.At(500, 100) == FakeGameRegion::PatternAt(500, 100));
+    }
+
+    SUBCASE("PreRender puts the original pixels back without a repaint") {
+        CHECK(RenderZoom::PreRender() == false);
+        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
+        CHECK(game.At(399, 299) == FakeGameRegion::PatternAt(399, 299));
+        // A second frame without a backup changes nothing.
+        CHECK(RenderZoom::PreRender() == false);
+    }
+}
+
+TEST_CASE("RenderZoom: lock rejections leave the frame alone") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+
+    SUBCASE("a 24 bit surface is not backed up") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(800, 600));
+        game.FillPattern();
+        game.surface->bpp = 3;
+        Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+
+        RenderZoom::PostRender();
+        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
+        CHECK(RenderZoom::PreRender() == false);
+    }
+
+    SUBCASE("a view rect wider than the surface is rejected") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(800, 600));
+        game.FillPattern();
+        Zoomer::SetViewRect({ 0, 0, 900, 600 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+
+        RenderZoom::PostRender();
+        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
+        CHECK(RenderZoom::PreRender() == false);
+    }
+
+    SUBCASE("an odd pitch is rejected") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(800, 600));
+        game.FillPattern();
+        game.surface->pitch = 801;
+        Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+
+        RenderZoom::PostRender();
+        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
+    }
+
+    SUBCASE("a pitch below the view right edge fails CopyRows and unlocks") {
+        FakeGameRegion game;
+        REQUIRE(game.Create(800, 600));
+        game.FillPattern();
+        // Positive and even, so LockView accepts it, but below
+        // view.right * 2, so CopyRows refuses to walk the rows.
+        game.surface->pitch = 100;
+        Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
+        Zoomer::g_zoom.store(2.0f);
+        Zoomer::g_targetZoom.store(2.0f);
+
+        RenderZoom::PostRender();
+        CHECK(game.surface->locks == 0);
+        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
+        CHECK(RenderZoom::PreRender() == false);
+    }
+}
+
+TEST_CASE("RenderZoom: Init disables the module outside the game") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+
+    RenderZoom::Init();
+    CHECK(RenderZoom::IsEnabled() == false);
+}
+
+TEST_CASE("GameCamera: Enable refuses outside the game") {
+    TestableZoomer::ResetState();
+
+    GameCamera::Enable();
+    CHECK(GameCamera::IsEnabled() == false);
+
+    POINT p = { 0, 0 };
+    CHECK(GameCamera::Read(p) == false);
+    CHECK(GameCamera::WriteAbs(p) == false);
+    CHECK(GameCamera::ShiftBy(1, 1) == false);
+
+    GameCamera::Disable(); // already off, nothing to do
+    CHECK(GameCamera::IsEnabled() == false);
+}
+
+TEST_CASE("Hook: GameInt") {
+    TestableZoomer::ResetState();
+
+    REGISTERS R{};
+    CHECK(GameInt(&R) == 0);
+
+    // Let the init thread wind down before the next case inspects state.
+    if (TestableZoomer::g_hThread)
+        WaitForSingleObject(TestableZoomer::g_hThread, 2000);
+}
+
+// ==================== GameCamera against a fake TacticalClass ====================
+
+namespace
+{
+    // Fake TacticalClass instance: only the view center at +0xD64/+0xD68 is
+    // touched (by GameCamera through its SetTacticalInstanceForTest seam, so
+    // the fixed game slot at 0x887324 stays untouched as well).
+    constexpr size_t VIEW_CENTER_X_OFF = 0xD64;
+    constexpr size_t VIEW_CENTER_Y_OFF = 0xD68;
+
+    struct FakeTactical
+    {
+        BYTE obj[0xD64 + 8] = {};
+
+        void SetViewCenter(int x, int y)
+        {
+            *reinterpret_cast<int*>(obj + VIEW_CENTER_X_OFF) = x;
+            *reinterpret_cast<int*>(obj + VIEW_CENTER_Y_OFF) = y;
+        }
+
+        POINT ViewCenter() const
+        {
+            POINT p = {
+                *reinterpret_cast<const int*>(obj + VIEW_CENTER_X_OFF),
+                *reinterpret_cast<const int*>(obj + VIEW_CENTER_Y_OFF)
+            };
+            return p;
+        }
+    };
+
+    // WriteAbs target: records the requested position as the new view center
+    // (g_stubAccepts simulates the game clamping the move to a no-op).
+    static bool g_stubAccepts = true;
+
+    static void __fastcall StubSetCameraPosition(void* self, void* /*edx*/, void* point)
+    {
+        if (!g_stubAccepts) return;
+        const POINT* p = static_cast<const POINT*>(point);
+        BYTE* base = static_cast<BYTE*>(self);
+        *reinterpret_cast<int*>(base + VIEW_CENTER_X_OFF) = p->x;
+        *reinterpret_cast<int*>(base + VIEW_CENTER_Y_OFF) = p->y;
+    }
+
+    static void AttachFakeCamera(FakeTactical& tac)
+    {
+        g_stubAccepts = true;
+        GameCamera::SetCameraPositionForTest(reinterpret_cast<void*>(&StubSetCameraPosition));
+        GameCamera::EnableForTest();
+        GameCamera::SetTacticalInstanceForTest(tac.obj);
+    }
+
+    static void DetachFakeCamera()
+    {
+        g_stubAccepts = true;
+        GameCamera::SetCameraPositionForTest(nullptr);
+        GameCamera::SetTacticalInstanceForTest(nullptr);
+        GameCamera::Disable();
+    }
+}
+
+TEST_CASE("GameCamera: read, write and shift through a fake tactical instance") {
+    TestableZoomer::ResetState();
+    FakeTactical tac;
+
+    GameCamera::SetCameraPositionForTest(reinterpret_cast<void*>(&StubSetCameraPosition));
+
+    POINT p = { 7, 7 };
+
+    // Disabled wrapper: every entry refuses before touching game memory.
+    CHECK(GameCamera::Read(p) == false);
+
+    GameCamera::EnableForTest();
+
+    // No instance in the slot yet.
+    CHECK(GameCamera::Read(p) == false);
+    CHECK(GameCamera::WriteAbs(p) == false);
+    CHECK(GameCamera::ShiftBy(0, 0) == true);
+    CHECK(GameCamera::ShiftBy(10, 0) == false);
+
+    // Instance present: read the view center.
+    GameCamera::SetTacticalInstanceForTest(tac.obj);
+    tac.SetViewCenter(123, 45);
+    CHECK(GameCamera::Read(p) == true);
+    CHECK(p.x == 123);
+    CHECK(p.y == 45);
+
+    // Absolute placement runs through the (stubbed) SetCameraPosition.
+    CHECK(GameCamera::WriteAbs({ 200, 150 }) == true);
+    POINT center = tac.ViewCenter();
+    CHECK(center.x == 200);
+    CHECK(center.y == 150);
+
+    // Read + move + verify the camera actually ended up elsewhere.
+    CHECK(GameCamera::ShiftBy(50, 25) == true);
+    center = tac.ViewCenter();
+    CHECK(center.x == 250);
+    CHECK(center.y == 175);
+
+    // The game refused the move: the center did not change -> failure.
+    g_stubAccepts = false;
+    CHECK(GameCamera::ShiftBy(10, 0) == false);
+
+    GameCamera::Disable();
+    CHECK(GameCamera::IsEnabled() == false);
+
+    DetachFakeCamera();
+}
+
+TEST_CASE("Zoomer: camera steps and the offset drive the fake camera") {
+    TestableZoomer::ResetState();
+    FakeTactical tac;
+    AttachFakeCamera(tac);
+
+    TestableZoomer::g_centerX = 400;
+    TestableZoomer::g_centerY = 300;
+    tac.SetViewCenter(400, 300);
+
+    // Invalid zoom pairs return before anything is computed.
+    TestableZoomer::ApplyCameraStep(0.0f, 2.0f);
+    TestableZoomer::ApplyCameraStep(2.0f, 2.0f);
+
+    // No focus latch: the view center doubles as focus == fixed point -> no shift.
+    TestableZoomer::g_focusValid = false;
+    TestableZoomer::ApplyCameraStep(1.0f, 2.0f);
+    CHECK(TestableZoomer::g_camOffset.x == 0);
+    CHECK(TestableZoomer::g_camOffset.y == 0);
+
+    // Focus left of the center: the camera moves left, the offset records it.
+    TestableZoomer::g_focusValid = true;
+    TestableZoomer::g_focusX = 300;
+    TestableZoomer::g_focusY = 300;
+    TestableZoomer::ApplyCameraStep(1.0f, 2.0f);
+    CHECK(TestableZoomer::g_camOffset.x == -50);
+    CHECK(TestableZoomer::g_camOffset.y == 0);
+    POINT center = tac.ViewCenter();
+    CHECK(center.x == 350);
+    CHECK(center.y == 300);
+
+    // The game refuses the move: the offset stays as it was.
+    g_stubAccepts = false;
+    TestableZoomer::ApplyCameraStep(2.0f, 1.0f);
+    CHECK(TestableZoomer::g_camOffset.x == -50);
+
+    // Undo while the game refuses: the offset survives.
+    TestableZoomer::UndoCameraOffset();
+    CHECK(TestableZoomer::g_camOffset.x == -50);
+
+    // Undo while the game accepts: the offset is dropped.
+    g_stubAccepts = true;
+    TestableZoomer::UndoCameraOffset();
+    CHECK(TestableZoomer::g_camOffset.x == 0);
+    CHECK(TestableZoomer::g_camOffset.y == 0);
+    center = tac.ViewCenter();
+    CHECK(center.x == 400);
+    CHECK(center.y == 300);
+
+    // Panning through the enabled wrapper (the return value is ignored here).
+    TestableZoomer::PanCamera(10, 5);
+    center = tac.ViewCenter();
+    CHECK(center.x == 410);
+    CHECK(center.y == 305);
+
+    DetachFakeCamera();
+}
+
+TEST_CASE("DefaultViewRect follows the redirected WindowBounds") {
+    TestableZoomer::ResetState();
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600));
+
+    // Fixture defaults to {0, 0, 800, 600}.
+    RECT r = Zoomer::DefaultViewRect();
+    CHECK(SameRect(r, RECT{ 0, 0, 800, 600 }));
+
+    game.SetWindow(100, 50, 640, 480);
+    r = Zoomer::DefaultViewRect();
+    CHECK(SameRect(r, RECT{ 100, 50, 740, 530 }));
+
+    // Non-positive extent falls back to the default rect.
+    game.SetWindow(10, 10, 0, 400);
+    CHECK(SameRect(Zoomer::DefaultViewRect(), RECT{ 0, 0, 800, 600 }));
+}
+
+TEST_CASE("NewWndProc: arrow keys pan while zoomed") {
+    TestableZoomer::ResetState();
+
+    MockWindow win;
+    REQUIRE(win.Create());
+    TestableZoomer::g_hWnd = win.hWnd;
+    TestableZoomer::g_zoom.store(2.0f);
+    TestableZoomer::g_targetZoom.store(2.0f);
+
+    const int stepX = (int)(800.0f / 2.0f * 0.2f);
+    const int stepY = (int)(600.0f / 2.0f * 0.2f);
+    const LONG cx0 = TestableZoomer::g_centerX.load();
+    const LONG cy0 = TestableZoomer::g_centerY.load();
+
+    g_recordedMsg = 0;
+
+    CHECK(TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_LEFT, 0) == 0);
+    CHECK(TestableZoomer::g_centerX.load() == cx0 - stepX);
+
+    CHECK(TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_RIGHT, 0) == 0);
+    CHECK(TestableZoomer::g_centerX.load() == cx0);
+
+    CHECK(TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_UP, 0) == 0);
+    CHECK(TestableZoomer::g_centerY.load() == cy0 - stepY);
+
+    CHECK(TestableZoomer::NewWndProc(win.hWnd, WM_KEYDOWN, VK_DOWN, 0) == 0);
+    CHECK(TestableZoomer::g_centerY.load() == cy0);
+
+    // The keys were consumed, not passed on to the game.
+    CHECK(g_recordedMsg == 0);
+}
+
+TEST_CASE("Shutdown joins a pending init thread") {
+    TestableZoomer::ResetState();
+
+    Zoomer::g_hThread = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    REQUIRE(Zoomer::g_hThread != nullptr);
+
+    TestableZoomer::Shutdown();
+    CHECK(Zoomer::g_hThread == nullptr);
+}
+
+TEST_CASE("DllMain wires the log module on attach and detaches cleanly") {
+    TestableZoomer::ResetState();
+
+    HMODULE exe = GetModuleHandleW(nullptr);
+
+    CHECK(DllMain(exe, DLL_PROCESS_ATTACH, nullptr) == TRUE);
+
+    // With a module handle set the log path resolves and the write lands
+    // in a real file next to the test executable.
+    LOG("log coverage probe");
+    const char* logPath = Debug::GetLogPath();
+    CHECK(logPath[0] != '\0');
+    CHECK(GetFileAttributesA(logPath) != INVALID_FILE_ATTRIBUTES);
+
+    CHECK(DllMain(exe, DLL_PROCESS_DETACH, nullptr) == TRUE);
+
+    DeleteFileA(logPath);
+    Debug::SetDllHandle(nullptr);
+}
+
+// ==================== ScalerConflict ====================
+
+namespace
+{
+    // Copies our own build output to %TEMP%\ViewCtrlScalerTest\<fileName> so
+    // a module with that file name can be mapped without running its code.
+    // Returns the full path, empty when no build output is around.
+    std::wstring MakeFakeScalerFile(const wchar_t* fileName)
+    {
+        wchar_t exe[MAX_PATH] = {};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring path(exe);
+        // <repo>\tests\bin\ViewCtrlTests.exe -> <repo>
+        size_t cut = path.find_last_of(L'\\');
+        size_t cut2 = cut ? path.find_last_of(L'\\', cut - 1) : std::wstring::npos;
+        size_t cut3 = cut2 ? path.find_last_of(L'\\', cut2 - 1) : std::wstring::npos;
+        if (cut3 == std::wstring::npos || cut3 == 0)
+            return {};
+        const std::wstring root = path.substr(0, cut3);
+
+        std::wstring src = root + L"\\Release\\ViewCtrl.dll";
+        if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
+            src = root + L"\\Debug\\ViewCtrl.dll";
+        if (GetFileAttributesW(src.c_str()) == INVALID_FILE_ATTRIBUTES)
+            return {};
+
+        wchar_t temp[MAX_PATH] = {};
+        GetTempPathW(MAX_PATH, temp);
+        const std::wstring dir = std::wstring(temp) + L"ViewCtrlScalerTest";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        const std::wstring dst = dir + L"\\" + fileName;
+        if (!CopyFileW(src.c_str(), dst.c_str(), FALSE))
+            return {};
+        return dst;
+    }
+
+    void RemoveFakeScalerFile(const std::wstring& path)
+    {
+        if (path.empty())
+            return;
+        DeleteFileW(path.c_str());
+        const size_t slash = path.find_last_of(L'\\');
+        if (slash != std::wstring::npos)
+            RemoveDirectoryW(path.substr(0, slash).c_str());
+    }
+
+    // A mapped fake scaler that cleans up after itself even when a REQUIRE
+    // aborts the test case.
+    struct FakeScaler
+    {
+        std::wstring path;
+        HMODULE mod = nullptr;
+
+        explicit FakeScaler(std::wstring p) : path(std::move(p)) {}
+        ~FakeScaler()
+        {
+            Unmap();
+            RemoveFakeScalerFile(path);
+        }
+
+        bool Map()
+        {
+            if (path.empty())
+                return false;
+            mod = LoadLibraryExW(path.c_str(), nullptr, DONT_RESOLVE_DLL_REFERENCES);
+            return mod != nullptr;
+        }
+
+        void Unmap()
+        {
+            if (mod)
+            {
+                FreeLibrary(mod);
+                mod = nullptr;
+            }
+        }
+    };
+
+    // Minimal mapped-style PE image whose .syhks00 holds hookdecl entries
+    // ({addr, size, name ptr, pad} = 16 bytes on x86). `wrongSection` puts
+    // the table behind a differently named section instead.
+    struct FakeSyringeImage
+    {
+        std::vector<unsigned char> bytes;
+
+        explicit FakeSyringeImage(const std::vector<unsigned int>& hookAddrs,
+            bool withSection = true, bool validPe = true, bool wrongSection = false)
+        {
+            constexpr size_t IMG = 0x1000;
+            constexpr size_t SEC_RVA = 0x600;
+            bytes.assign(IMG, 0);
+            if (!validPe)
+            {
+                bytes[0] = 'X';
+                return;
+            }
+
+            auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(bytes.data());
+            dos->e_magic = IMAGE_DOS_SIGNATURE;
+            dos->e_lfanew = 0x80;
+
+            auto* nt = reinterpret_cast<IMAGE_NT_HEADERS*>(bytes.data() + 0x80);
+            nt->Signature = IMAGE_NT_SIGNATURE;
+            nt->FileHeader.NumberOfSections = withSection ? 1 : 0;
+            nt->FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER);
+
+            if (!withSection)
+                return;
+            auto* sec = IMAGE_FIRST_SECTION(nt);
+            std::memcpy(sec->Name, wrongSection ? ".other00" : ".syhks00", 8);
+            sec->Misc.VirtualSize = static_cast<DWORD>(hookAddrs.size() * 16);
+            sec->VirtualAddress = static_cast<DWORD>(SEC_RVA);
+            size_t off = 0;
+            for (unsigned int addr : hookAddrs)
+            {
+                std::memcpy(bytes.data() + SEC_RVA + off, &addr, sizeof(addr));
+                off += 16;
+            }
+        }
+    };
+}
+
+TEST_CASE("InitThread: hooks a visible window with GScript present") {
+    TestableZoomer::ResetState();
+
+    MockWindow win;
+    REQUIRE(win.Create());
+    ShowWindow(win.hWnd, SW_SHOW);
+    UpdateWindow(win.hWnd);
+
+    // A stand-in GScript.ext: our own build output mapped under that file
+    // name, its code never running - only GetModuleHandleA("GScript.ext")
+    // inside InitThread must succeed so the warning branch is taken.
+    FakeScaler gscript(MakeFakeScalerFile(L"GScript.ext"));
+    REQUIRE(!gscript.path.empty());
+    REQUIRE(gscript.Map());
+
+    // GameInt refuses to run while GScript is loaded - it is the mod's own
+    // scaler - so drive the init thread directly; the gate itself is
+    // covered by the ScalerConflict cases below.
+    Zoomer::Init();
+    REQUIRE(TestableZoomer::g_hThread != nullptr);
+    WaitForSingleObject(TestableZoomer::g_hThread, 2000);
+
+    CHECK(TestableZoomer::g_hWnd != nullptr);
+    CHECK(TestableZoomer::g_wndProcHooked == true);
+    CHECK(TestableZoomer::OriginalWndProc != nullptr);
+    CHECK(TestableZoomer::g_initialized == true);
+
+    // Restores the window procedure before the mock window is destroyed.
+    TestableZoomer::Shutdown();
+    CHECK(TestableZoomer::g_wndProcHooked == false);
+    CHECK(TestableZoomer::OriginalWndProc == nullptr);
+
+    gscript.Unmap();
+}
+
+TEST_CASE("ScalerConflict: known scaler module names") {
+    CHECK(ScalerConflict::IsScalerModuleName(L"GScript.ext"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"gscript.ext"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"GSCRIPT.EXT"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"Telescope.dll"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"telescope.DLL"));
+
+    CHECK(!ScalerConflict::IsScalerModuleName(L"Phobos.ext"));
+    CHECK(!ScalerConflict::IsScalerModuleName(L"Ares.dll"));
+    CHECK(!ScalerConflict::IsScalerModuleName(L"ViewCtrl.dll"));
+    CHECK(!ScalerConflict::IsScalerModuleName(L""));
+    CHECK(!ScalerConflict::IsScalerModuleName(nullptr));
+}
+
+TEST_CASE("ScalerConflict: own .syhks00 declares the nine hook sites") {
+    unsigned int sites[16] = {};
+    CHECK(ScalerConflict::OwnHookSites(sites, 16) == 9);
+    CHECK(sites[0] == 0x52CAE9u);
+    CHECK(sites[8] == 0x693791u);
+
+    CHECK(ScalerConflict::OwnHookSites(nullptr, 4) == 0);
+    CHECK(ScalerConflict::OwnHookSites(sites, 0) == 0);
+
+    unsigned int tiny[2] = {};
+    CHECK(ScalerConflict::OwnHookSites(tiny, 2) == 2);
+    CHECK(tiny[0] == 0x52CAE9u);
+}
+
+TEST_CASE("ScalerConflict: .syhks00 share separates co-hookers from scalers") {
+    unsigned int sites[16] = {};
+    const unsigned int n = ScalerConflict::OwnHookSites(sites, 16);
+    REQUIRE(n == 9);
+
+    // One or two shared sites: an ordinary framework plugin, not a scaler.
+    FakeSyringeImage oneSite({ 0x1234u, sites[0] });
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(oneSite.bytes.data(), sites, n));
+    FakeSyringeImage twoSites({ sites[0], sites[1] });
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(twoSites.bytes.data(), sites, n));
+
+    // Three or more: another copy of the zoom pipeline (Telescope has all).
+    FakeSyringeImage threeSites({ sites[0], sites[1], sites[2] });
+    CHECK(ScalerConflict::ImageClaimsScalerShare(threeSites.bytes.data(), sites, n));
+    const std::vector<unsigned int> all(sites, sites + n);
+    FakeSyringeImage nineSites(all);
+    CHECK(ScalerConflict::ImageClaimsScalerShare(nineSites.bytes.data(), sites, n));
+
+    // Foreign hooks only, no .syhks00 at all, not a PE image.
+    FakeSyringeImage foreign({ 0x1234u, 0x5555u });
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(foreign.bytes.data(), sites, n));
+    FakeSyringeImage noSection({}, false);
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(noSection.bytes.data(), sites, n));
+    FakeSyringeImage wrongSection({ sites[0], sites[1], sites[2] },
+        true, true, true);
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(wrongSection.bytes.data(), sites, n));
+    FakeSyringeImage junk({}, true, false);
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(junk.bytes.data(), sites, n));
+
+    // Corrupt DOS/NT headers.
+    FakeSyringeImage badLfanew({ sites[0] });
+    reinterpret_cast<IMAGE_DOS_HEADER*>(badLfanew.bytes.data())->e_lfanew = 0x7FFFFFFF;
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(badLfanew.bytes.data(), sites, n));
+
+    FakeSyringeImage badSig({ sites[0] });
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(badSig.bytes.data());
+    reinterpret_cast<IMAGE_NT_HEADERS*>(badSig.bytes.data() + dos->e_lfanew)->Signature = 0;
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(badSig.bytes.data(), sites, n));
+
+    // Degenerate inputs.
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(nullptr, sites, n));
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(threeSites.bytes.data(), sites, 0));
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(threeSites.bytes.data(), nullptr, n));
+}
+
+TEST_CASE("ScalerConflict: a clean process reports no conflict") {
+    CHECK(ScalerConflict::Present() == false);
+}
+
+TEST_CASE("ScalerConflict: Present() detects a loaded scaler") {
+    FakeScaler byName(MakeFakeScalerFile(L"GScript.ext"));
+    REQUIRE(!byName.path.empty());
+    FakeScaler byClaim(MakeFakeScalerFile(L"ScalerClaim.dll"));
+    REQUIRE(!byClaim.path.empty());
+
+    // Name match: the copy is a full fork, but GScript.ext is the flag.
+    REQUIRE(byName.Map());
+    CHECK(ScalerConflict::Present());
+    byName.Unmap();
+    CHECK(!ScalerConflict::Present());
+
+    // Hook-claim match under an unknown file name: our sites are a full share.
+    REQUIRE(byClaim.Map());
+    CHECK(ScalerConflict::Present());
+    byClaim.Unmap();
+    CHECK(!ScalerConflict::Present());
+}
+
+TEST_CASE("GameInt: stays inert while a conflicting scaler is loaded") {
+    Zoomer::Shutdown(); // clean slate: g_initStarted / g_hThread reset
+    TestableZoomer::ResetState();
+
+    FakeScaler scaler(MakeFakeScalerFile(L"GScript.ext"));
+    REQUIRE(!scaler.path.empty());
+    REQUIRE(scaler.Map());
+
+    REGISTERS R{};
+    CHECK(GameInt(&R) == 0);
+    CHECK(TestableZoomer::g_hThread == nullptr);
+    CHECK(TestableZoomer::g_initialized == false);
+
+    // The gate lifts again once the scaler is gone.
+    scaler.Unmap();
+    REGISTERS R2{};
+    CHECK(GameInt(&R2) == 0);
+    CHECK(TestableZoomer::g_hThread != nullptr);
+    WaitForSingleObject(TestableZoomer::g_hThread, 2000);
+    TestableZoomer::Shutdown();
+}
+

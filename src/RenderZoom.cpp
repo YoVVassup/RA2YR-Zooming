@@ -1,5 +1,6 @@
 #include "RenderZoom.hpp"
 #include "Zoomer.hpp"
+#include "GameAddrs.hpp"
 #include "Log.h"
 
 #include <cstring>
@@ -7,11 +8,6 @@
 
 namespace
 {
-	// Game globals (YRpp Surface.h).
-	constexpr DWORD ADDR_VIEW_BOUNDS = 0x886FA0;    // RectangleStruct {X, Y, W, H}
-	constexpr DWORD ADDR_WINDOW_BOUNDS = 0x886FB0;
-	constexpr DWORD ADDR_COMPOSITE = 0x88731C;       // DSurface*
-
 	// Surface vtable slots (YRpp Surface.h).
 	constexpr int VT_LOCK = 23;
 	constexpr int VT_UNLOCK = 24;
@@ -21,7 +17,7 @@ namespace
 	constexpr int VT_GET_HEIGHT = 32;
 
 	// The view rect is only looked at while the zoom factor sits at 1.0, and
-	// at most four times a second (same throttle as Telescope).
+	// at most four times a second.
 	constexpr DWORD VIEW_RECT_POLL_MS = 250;
 
 	constexpr float ZOOM_EPSILON = 1.001f;
@@ -42,6 +38,14 @@ namespace
 	bool g_viewRectValid = false;
 	DWORD g_lastViewPoll = 0;
 
+	// Indirection over the hard coded game globals: the defaults are the
+	// production addresses, SetTestGameRegion (VIEWCTRL_TEST) redirects them
+	// into a region the test owns so IsGameReadable accepts it.
+	HMODULE g_gameModuleOverride = nullptr;
+	const void* g_compositeSlot = reinterpret_cast<const void*>(GameAddr::DSurface_Composite);
+	const void* g_viewBounds = reinterpret_cast<const void*>(GameAddr::DSurface_ViewBounds);
+	const void* g_windowBounds = reinterpret_cast<const void*>(GameAddr::DSurface_WindowBounds);
+
 	bool IsReadable(const void* address, size_t bytes)
 	{
 		if (!address || bytes == 0) return false;
@@ -58,9 +62,9 @@ namespace
 
 	void* CompositeSurface()
 	{
-		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_COMPOSITE), sizeof(void*)))
+		if (!RenderZoom::IsGameReadable(g_compositeSlot, sizeof(void*)))
 			return nullptr;
-		return *reinterpret_cast<void**>(ADDR_COMPOSITE);
+		return *reinterpret_cast<void* const*>(g_compositeSlot);
 	}
 
 	void** VTable(void* object)
@@ -74,13 +78,17 @@ namespace
 
 	bool ReadGameViewRect(RECT& out)
 	{
-		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_VIEW_BOUNDS), 4 * sizeof(int))) return false;
-		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_WINDOW_BOUNDS), 4 * sizeof(int))) return false;
+		if (!RenderZoom::IsGameReadable(g_viewBounds, 4 * sizeof(int))) return false;
+		if (!RenderZoom::IsGameReadable(g_windowBounds, 4 * sizeof(int))) return false;
 
+		// Both globals are RectangleStruct {X, Y, W, H}. Read them as ints and
+		// convert explicitly to {left=X, top=Y, right=X+W, bottom=Y+H} below: a
+		// memcpy straight into a RECT would take W/H for right/bottom and only
+		// looks correct while X=Y=0.
 		int view[4] = {};
 		int window[4] = {};
-		memcpy(view, reinterpret_cast<const void*>(ADDR_VIEW_BOUNDS), sizeof(view));
-		memcpy(window, reinterpret_cast<const void*>(ADDR_WINDOW_BOUNDS), sizeof(window));
+		memcpy(view, g_viewBounds, sizeof(view));
+		memcpy(window, g_windowBounds, sizeof(window));
 
 		// Only a view rect that is smaller than the window rect describes the
 		// tactical view — the sidebar is what makes it smaller. Otherwise the
@@ -150,17 +158,29 @@ namespace
 
 	// Everything the replaced "mov ebx, [0x886FA8]" / "[0x886FAC]" would have
 	// loaded, swapped for the visible source rect while the view is magnified.
+	//
+	// If the global cannot be read the last value seen is returned, not 0:
+	// feeding 0 into ClampCoordMap would pin the camera at the map origin,
+	// while a vanilla-sized dimension keeps the clamp behaving like the
+	// unhooked game. Seed: the view size the game itself writes at init
+	// (mov [0x886FA8], 0x280 / mov [0x886FAC], 0x190 -> 640x400).
 	int ClampViewDimension(bool width)
 	{
-		const DWORD address = ADDR_VIEW_BOUNDS + (width ? 2 : 3) * sizeof(int);
-		if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(address), sizeof(int))) return 0;
+		static int lastWidth = 640;
+		static int lastHeight = 400;
+
+		const auto* address = reinterpret_cast<const BYTE*>(g_viewBounds)
+			+ (width ? 2 : 3) * sizeof(int);
+		if (!RenderZoom::IsGameReadable(address, sizeof(int)))
+			return width ? lastWidth : lastHeight;
 		const int gameDim = *reinterpret_cast<const int*>(address);
+		(width ? lastWidth : lastHeight) = gameDim;
 
 		const float zoom = Zoomer::CurrentZoom();
 		if (zoom <= ZOOM_EPSILON) return gameDim;
 
-		// Telescope only substitutes once a view rect has been observed;
-		// before that the game dimension stands.
+		// Substitute only once a view rect has been observed; before that
+		// the game dimension stands.
 		RECT view = {};
 		if (!RenderZoom::CachedViewRect(view)) return gameDim;
 
@@ -180,7 +200,9 @@ namespace
 // unrelated memory, so they are rejected there before anything is read.
 bool RenderZoom::IsGameReadable(const void* address, size_t bytes)
 {
-	const HMODULE game = GetModuleHandleA("gamemd.exe");
+	const HMODULE game = g_gameModuleOverride
+		? g_gameModuleOverride
+		: GetModuleHandleA("gamemd.exe");
 	if (!game) return false;
 	if (!IsReadable(address, bytes)) return false;
 
@@ -189,7 +211,7 @@ bool RenderZoom::IsGameReadable(const void* address, size_t bytes)
 	return mbi.AllocationBase == game;
 }
 
-void RenderZoom::Init(bool zoomEnabled)
+void RenderZoom::Init()
 {
 	ResetFrameState();
 
@@ -198,8 +220,8 @@ void RenderZoom::Init(bool zoomEnabled)
 	_strlwr(path);
 	const bool isGame = (strstr(path, "gamemd.exe") != nullptr);
 
-	g_enabled = zoomEnabled && isGame;
-	LOG("RenderZoom: enabled=%d (zoomEnabled=%d, gamemd=%d)", g_enabled, zoomEnabled, isGame);
+	g_enabled = isGame;
+	LOG("RenderZoom: enabled=%d (gamemd=%d)", g_enabled, isGame);
 }
 
 void RenderZoom::Shutdown()
@@ -212,6 +234,33 @@ void RenderZoom::Shutdown()
 void RenderZoom::SetEnabled(bool enabled)
 {
 	g_enabled = enabled;
+}
+
+bool RenderZoom::IsEnabled()
+{
+	return g_enabled;
+}
+
+void RenderZoom::SetTestGameRegion(void* moduleBase, const void* compositeSlot, const void* viewBounds, const void* windowBounds)
+{
+	if (moduleBase)
+	{
+		g_gameModuleOverride = static_cast<HMODULE>(moduleBase);
+		if (compositeSlot) g_compositeSlot = compositeSlot;
+		if (viewBounds) g_viewBounds = viewBounds;
+		if (windowBounds) g_windowBounds = windowBounds;
+		return;
+	}
+
+	g_gameModuleOverride = nullptr;
+	g_compositeSlot = reinterpret_cast<const void*>(GameAddr::DSurface_Composite);
+	g_viewBounds = reinterpret_cast<const void*>(GameAddr::DSurface_ViewBounds);
+	g_windowBounds = reinterpret_cast<const void*>(GameAddr::DSurface_WindowBounds);
+}
+
+const void* RenderZoom::TestWindowBoundsAddress()
+{
+	return g_windowBounds;
 }
 #endif
 
@@ -378,7 +427,9 @@ bool RenderZoom::CopyRows(
 	const int h = view.bottom - view.top;
 	if (w <= 0 || h <= 0) return false;
 	if (w > bufferW || h > bufferH) return false;
-	if (pitch < w * 2) return false;
+	// Every row starts at view.left, so the pitch has to hold the whole
+	// right edge and not only the width of the copy.
+	if (pitch < view.right * 2) return false;
 
 	const size_t rowBytes = (size_t)w * 2;
 	const size_t bufferStride = (size_t)bufferW * 2;

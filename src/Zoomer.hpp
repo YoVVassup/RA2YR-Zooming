@@ -14,9 +14,6 @@ constexpr float ZOOM_SNAP = 0.001f;
 // Maximum gap between two key presses that counts as a double press.
 constexpr DWORD DOUBLE_PRESS_MS = 400;
 
-constexpr size_t GSCRIPT_ZOOM_FACTOR_RVA = 0x1739B0;
-constexpr BYTE   GSCRIPT_ZOOM_FACTOR_BYTES[] = { 0xB0, 0x39, 0x17, 0x10 };
-
 class Zoomer
 {
 public:
@@ -45,18 +42,14 @@ public:
 	// take precedence over the window size.
 	static void SetViewRect(const RECT& rect, bool fromGame);
 
-	// True when another extension (Ares' GScript zoom) owns the zoom factor.
-	static bool UsingGScript();
-
 	// True while the view is magnified (zoom differs from 1.0 beyond the
-	// snap epsilon). Telescope gates its coordinate transforms the same way.
+	// snap epsilon); the coordinate transforms stay idle until then.
 	static bool ZoomActive();
 
 	// Maps a view relative point the game computed from the physical cursor
 	// onto the source rect that is actually displayed there. Returns false
 	// when the zoom is inactive or the point lies outside the view rect.
-	// Port of Telescope's FUN_1003d1b0/FUN_1003be70 pair: it is the inverse
-	// of what RenderZoom::Upscale draws, so out is view relative too.
+	// The inverse of what RenderZoom::Upscale draws, so out is view relative.
 	static bool UnMagnify(const POINT& in, POINT& out);
 
 	// Scale between a screen delta and the content it moves (source rect over
@@ -81,8 +74,7 @@ private:
 
 	// True while Ctrl is physically held (tests inject the state instead of
 	// pressing real keys). Ctrl doubles as the wheel modifier and, when
-	// pressed twice within DOUBLE_PRESS_MS, as the reset key - the same
-	// combination Telescope uses.
+	// pressed twice within DOUBLE_PRESS_MS, as the reset key.
 	static bool CtrlHeld();
 
 	// Wheel zoom: multiplies the factor by ZOOM_GEAR per scroll step in the
@@ -130,6 +122,15 @@ private:
 	static inline DWORD    g_lastPressMs = 0;
 	static inline bool     g_haveLastPress = false;
 
+	// Leftover of a wheel delta below WHEEL_DELTA. Smooth scrolling (touch
+	// pads, Windows 10) delivers smaller deltas, they have to add up to a
+	// whole step instead of being dropped.
+	static inline int      g_wheelRemainder = 0;
+
+	// Set by Init() before the thread starts, so a second call cannot
+	// subclass the window proc a second time.
+	static inline bool     g_initStarted = false;
+
 #ifdef VIEWCTRL_TEST
 	// Wheel zoom modifier injected by the unit tests.
 	static inline bool     g_ctrlHeld = false;
@@ -148,7 +149,4 @@ private:
 	static inline LARGE_INTEGER g_perfFrequency = {};
 	static inline LARGE_INTEGER g_lastLerpTime = {};
 	static inline bool     g_perfCounterReady = false;
-
-	static inline bool     g_useGScript = false;
-	static inline float*   g_pZoomFactor = nullptr;
 };

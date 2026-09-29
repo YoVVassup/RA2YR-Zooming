@@ -1,4 +1,5 @@
 #include "GameCamera.hpp"
+#include "GameAddrs.hpp"
 #include "Log.h"
 
 // YRpp is a third-party header set: keep its unused-parameter noise out of
@@ -13,20 +14,33 @@ namespace
 {
 	bool g_enabled = false;
 
-	// TacticalClass::SetViewPos(POINT*) @ 0x6D6000 — __thiscall, one stack
-	// argument. It runs the point through ClampCoordMap (0x6D8640), stores it
-	// as the view center (this+0xD64/0xD68) and as the last position
-	// (this+0xD74/0xD78), recalculates the view origin
-	// (CalcViewportCells, 0x6D8B30 -> TacticalPos at this+0xB0) and raises the
-	// redrawing flag (this+0xD7D).
-	using SetViewPosFn = void(__fastcall*)(void* self, void* /*edx*/, void* point);
-	constexpr uintptr_t SET_VIEW_POS = 0x6D6000;
-	constexpr BYTE     SET_VIEW_POS_PROLOGUE = 0x83; // sub esp, 8
+	// TacticalMapClass::SetCameraPosition(POINT*) (GameAddr, 0x6D6000, ReSource)
+	// — __thiscall, one stack argument. (YRpp has no entry; SetTacticalPosition
+	// is a different function at 0x6D6070, hooked by Phobos.) It runs the point
+	// through ClampCoordMap (0x6D8640), stores it as the view center
+	// (this+0xD64/0xD68) and as the last position (this+0xD74/0xD78),
+	// recalculates the view origin (CalcViewportCells, 0x6D8B30 -> TacticalPos
+	// at this+0xB0) and raises the redrawing flag (this+0xD7D).
+	using SetCameraPositionFn = void(__fastcall*)(void* self, void* /*edx*/, void* point);
+	constexpr uintptr_t SET_CAMERA_POSITION = GameAddr::TacticalMapClass_SetCameraPosition;
+	constexpr BYTE     SET_CAMERA_POSITION_PROLOGUE = 0x83; // sub esp, 8
 
 	// View center inside TacticalClass: right after visibleCells[800],
 	// immediately before field_D6C (unnamed in YRpp).
 	constexpr size_t VIEW_CENTER_X = 0xD64;
 	constexpr size_t VIEW_CENTER_Y = 0xD68;
+
+#ifdef VIEWCTRL_TEST
+	// Redirectable WriteAbs target: tests point this at a stub instead of the
+	// real game entry point (which does not exist outside gamemd.exe).
+	SetCameraPositionFn g_setCameraPosition = reinterpret_cast<SetCameraPositionFn>(SET_CAMERA_POSITION);
+
+	// Test double for TacticalClass::Instance: the real reference is bound to
+	// a fixed game address whose page can collide with DLL images (ASLR) in
+	// the test process, so tests supply the instance explicitly. Null is the
+	// "no instance" state, not a fallback to the game slot.
+	TacticalClass* g_tacticalInstance = nullptr;
+#endif
 }
 
 POINT GameCamera::ComputeShift(POINT focus, POINT fixedPoint, float oldZoom, float newZoom)
@@ -49,21 +63,21 @@ void GameCamera::Enable()
 	HMODULE module = nullptr;
 	if (!GetModuleHandleExA(
 		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-		reinterpret_cast<LPCSTR>(SET_VIEW_POS), &module) || module == nullptr)
+		reinterpret_cast<LPCSTR>(SET_CAMERA_POSITION), &module) || module == nullptr)
 	{
-		LOG("GameCamera: address 0x%IX is not inside a loaded module, disabled", SET_VIEW_POS);
+		LOG("GameCamera: address 0x%IX is not inside a loaded module, disabled", SET_CAMERA_POSITION);
 		return;
 	}
 
-	if (*reinterpret_cast<const BYTE*>(SET_VIEW_POS) != SET_VIEW_POS_PROLOGUE)
+	if (*reinterpret_cast<const BYTE*>(SET_CAMERA_POSITION) != SET_CAMERA_POSITION_PROLOGUE)
 	{
-		LOG("GameCamera: unexpected prologue at 0x%IX, disabled", SET_VIEW_POS);
+		LOG("GameCamera: unexpected prologue at 0x%IX, disabled", SET_CAMERA_POSITION);
 		return;
 	}
 
 	g_enabled = true;
-	LOG("GameCamera: enabled (SetViewPos=%p module=%p instance=%p)",
-		reinterpret_cast<void*>(SET_VIEW_POS), module, TacticalClass::Instance);
+	LOG("GameCamera: enabled (SetCameraPosition=%p module=%p instance=%p)",
+		reinterpret_cast<void*>(SET_CAMERA_POSITION), module, TacticalClass::Instance);
 }
 
 void GameCamera::Disable()
@@ -82,7 +96,11 @@ bool GameCamera::Read(POINT& out)
 {
 	if (!g_enabled) return false;
 
+#ifdef VIEWCTRL_TEST
+	TacticalClass* tactical = g_tacticalInstance;
+#else
 	TacticalClass* tactical = TacticalClass::Instance;
+#endif
 	if (!tactical) return false;
 
 	const BYTE* base = reinterpret_cast<const BYTE*>(tactical);
@@ -95,11 +113,19 @@ bool GameCamera::WriteAbs(const POINT& point)
 {
 	if (!g_enabled) return false;
 
+#ifdef VIEWCTRL_TEST
+	TacticalClass* tactical = g_tacticalInstance;
+#else
 	TacticalClass* tactical = TacticalClass::Instance;
+#endif
 	if (!tactical) return false;
 
 	POINT target = point;
-	reinterpret_cast<SetViewPosFn>(SET_VIEW_POS)(tactical, nullptr, &target);
+#ifdef VIEWCTRL_TEST
+	g_setCameraPosition(tactical, nullptr, &target);
+#else
+	reinterpret_cast<SetCameraPositionFn>(SET_CAMERA_POSITION)(tactical, nullptr, &target);
+#endif
 	return true;
 }
 
@@ -124,3 +150,22 @@ bool GameCamera::ShiftBy(int dx, int dy)
 	}
 	return true;
 }
+
+#ifdef VIEWCTRL_TEST
+void GameCamera::EnableForTest()
+{
+	g_enabled = true;
+}
+
+void GameCamera::SetTacticalInstanceForTest(void* instance)
+{
+	g_tacticalInstance = static_cast<TacticalClass*>(instance);
+}
+
+void GameCamera::SetCameraPositionForTest(void* fn)
+{
+	g_setCameraPosition = fn
+		? reinterpret_cast<SetCameraPositionFn>(fn)
+		: reinterpret_cast<SetCameraPositionFn>(SET_CAMERA_POSITION);
+}
+#endif

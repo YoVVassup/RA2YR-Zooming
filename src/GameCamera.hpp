@@ -26,11 +26,22 @@ namespace GameCamera
 	// Current view center of TacticalClass (this+0xD64/0xD68).
 	bool Read(POINT& out);
 
-	// Absolute camera placement through TacticalClass::SetViewPos (0x6D6000),
-	// i.e. the game clamps the point and recalculates the view origin itself.
+	// Absolute camera placement through TacticalMapClass::SetCameraPosition
+	// (GameAddr, 0x6D6000), i.e. the game clamps the point and recalculates
+	// the view origin itself.
 	bool WriteAbs(const POINT& point);
 
 	// Read + add + write. Returns false if the game refused the move
 	// (disabled, no instance, or the camera did not end up where asked).
 	bool ShiftBy(int dx, int dy);
+
+#ifdef VIEWCTRL_TEST
+	// Test seams: arm the wrapper without gamemd.exe (Enable() refuses outside
+	// the game module), point the TacticalClass instance at a fake object
+	// instead of the fixed game slot (which can collide with DLL images in
+	// the test process), and redirect the SetCameraPosition call to a stub.
+	void EnableForTest();
+	void SetTacticalInstanceForTest(void* instance);
+	void SetCameraPositionForTest(void* fn);
+#endif
 }

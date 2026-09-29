@@ -2,16 +2,16 @@
 
 #include <windows.h>
 
-// Frame by frame zoom of the tactical view, ported from Telescope.dll.
+// Frame by frame zoom of the tactical view.
 //
-// Two Syringe hooks around the tactical render drive it:
+// Two Syringe hooks inside GScreenClass::Render (0x4F4480, YRpp) drive it:
 //   0x4F44AF (pre)  - put the original pixels back so the game draws on the
 //                     clean frame, then advance the zoom lerp / game camera.
 //   0x4F451B (post) - back the freshly rendered view rect up and magnify it
 //                     in place inside DSurface::Composite.
 //
 // The view rect comes from DSurface::ViewBounds, polled at most every 250 ms
-// and only while the zoom factor is back at 1.0 (Telescope does the same).
+// and only while the zoom factor is back at 1.0.
 class RenderZoom
 {
 public:
@@ -24,8 +24,8 @@ public:
 		int H = 0;
 	};
 
-	// zoomEnabled: false while another extension (GScript) owns the zoom.
-	static void Init(bool zoomEnabled);
+	// Arms the render zoom; only meaningful inside gamemd.exe.
+	static void Init();
 	static void Shutdown();
 
 	// True when a game global may be dereferenced. Only inside gamemd.exe do
@@ -62,9 +62,9 @@ public:
 
 	static bool CachedViewRect(RECT& out);
 
-	// Sizes ClampCoordMap clamps the viewport against, reached from
-	// 0x6D864E (width) and 0x6D868A (height). Both instructions read
-	// DSurface::ViewBounds; while the view is magnified the visible world
+	// Sizes ClampCoordMap (GameAddr, 0x6D8640) clamps the viewport against,
+	// reached from 0x6D864E (width) and 0x6D868A (height). Both instructions
+	// read DSurface::ViewBounds; while the view is magnified the visible world
 	// area is the source rect instead, so the game clamps against that.
 	static int ClampWidth();
 	static int ClampHeight();
@@ -80,5 +80,17 @@ public:
 	// The frame hooks are no-ops until the module is enabled; tests flip this
 	// to reach the code that runs inside the game.
 	static void SetEnabled(bool enabled);
+	static bool IsEnabled();
+
+	// Redirects the hard coded game globals (DSurface::Composite slot,
+	// ViewBounds, WindowBounds) into a region the test owns; moduleBase is
+	// what IsGameReadable accepts as "the game module" afterwards. A null
+	// moduleBase restores the real addresses.
+	static void SetTestGameRegion(void* moduleBase, const void* compositeSlot,
+		const void* viewBounds, const void* windowBounds);
+
+	// Address the WindowBounds reads go through: the game global by default,
+	// the test region after SetTestGameRegion (Zoomer::DefaultViewRect).
+	static const void* TestWindowBoundsAddress();
 #endif
 };

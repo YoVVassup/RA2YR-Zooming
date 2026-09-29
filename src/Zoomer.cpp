@@ -1,9 +1,9 @@
 #include "Zoomer.hpp"
 #include "RenderZoom.hpp"
 #include "GameCamera.hpp"
+#include "GameAddrs.hpp"
 #include "Log.h"
 #include <windowsx.h>
-#include <psapi.h>
 
 void Zoomer::UpdateClientCache(HWND hWnd)
 {
@@ -44,16 +44,21 @@ RECT Zoomer::ViewRect()
 RECT Zoomer::DefaultViewRect()
 {
 	// DSurface::WindowBounds: the rectangle the game draws its window into.
-	constexpr DWORD ADDR_WINDOW_BOUNDS = 0x886FB0;
 	const RECT fallback = { 0, 0, 800, 600 };
 
-	if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(ADDR_WINDOW_BOUNDS), 4 * sizeof(int)))
+#ifdef VIEWCTRL_TEST
+	const uintptr_t windowBounds = reinterpret_cast<uintptr_t>(RenderZoom::TestWindowBoundsAddress());
+#else
+	const uintptr_t windowBounds = GameAddr::DSurface_WindowBounds;
+#endif
+	if (!RenderZoom::IsGameReadable(reinterpret_cast<const void*>(windowBounds), 4 * sizeof(int)))
 		return fallback;
 
-	const int left = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS);
-	const int top = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS + 4);
-	const int width = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS + 8);
-	const int height = *reinterpret_cast<const int*>(ADDR_WINDOW_BOUNDS + 12);
+	// RectangleStruct {X, Y, W, H} -> RECT {left, top, right=X+W, bottom=Y+H}.
+	const int left = *reinterpret_cast<const int*>(windowBounds);
+	const int top = *reinterpret_cast<const int*>(windowBounds + 4);
+	const int width = *reinterpret_cast<const int*>(windowBounds + 8);
+	const int height = *reinterpret_cast<const int*>(windowBounds + 12);
 	if (width <= 0 || height <= 0) return fallback;
 
 	const RECT rect = { left, top, left + width, top + height };
@@ -70,11 +75,6 @@ POINT Zoomer::ZoomAnchor()
 float Zoomer::CurrentZoom()
 {
 	return g_zoom.load();
-}
-
-bool Zoomer::UsingGScript()
-{
-	return g_useGScript;
 }
 
 bool Zoomer::ZoomActive()
@@ -103,8 +103,7 @@ bool Zoomer::ContentScale(float& scaleX, float& scaleY)
 
 bool Zoomer::UnMagnify(const POINT& in, POINT& out)
 {
-	// Telescopes coordinate transforms are gated behind an active zoom
-	// (its FUN_1003d5e0 active test).
+	// Coordinate transforms are gated behind an active zoom.
 	if (!ZoomActive()) return false;
 
 	const RECT view = g_viewRect;
@@ -112,8 +111,8 @@ bool Zoomer::UnMagnify(const POINT& in, POINT& out)
 	const int viewH = view.bottom - view.top;
 	if (viewW <= 0 || viewH <= 0) return false;
 
-	// The game hands over view relative coordinates: telescope turns them
-	// into absolute ones first and bounds them against the viewport.
+	// The game hands over view relative coordinates; bound them against the
+	// view rect first.
 	if (in.x < 0 || in.x >= viewW || in.y < 0 || in.y >= viewH) return false;
 
 	const POINT anchor = ZoomAnchor();
@@ -122,7 +121,7 @@ bool Zoomer::UnMagnify(const POINT& in, POINT& out)
 	if (src.W <= 0 || src.H <= 0) return false;
 
 	// Inverse of what RenderZoom::Upscale draws: the displayed view relative
-	// point picks its pixel from the source rect (telescope FUN_1003be70).
+	// point picks its pixel from the source rect.
 	float mappedX = (float)src.X + (float)in.x * (float)src.W / (float)viewW;
 	float mappedY = (float)src.Y + (float)in.y * (float)src.H / (float)viewH;
 
@@ -158,10 +157,13 @@ void Zoomer::ClampToViewport(POINT* pt)
 {
 	if (!pt) return;
 
-	if (pt->x < g_viewRect.left)   pt->x = g_viewRect.left;
-	if (pt->x > g_viewRect.right)  pt->x = g_viewRect.right;
-	if (pt->y < g_viewRect.top)    pt->y = g_viewRect.top;
-	if (pt->y > g_viewRect.bottom) pt->y = g_viewRect.bottom;
+	// The right and bottom edge belong to the next area (PtInRect, which
+	// IsPointInMapArea uses, and UnMagnify both exclude it), so the clamped
+	// point always ends up inside the view rect.
+	if (pt->x < g_viewRect.left)         pt->x = g_viewRect.left;
+	if (pt->x > g_viewRect.right - 1)    pt->x = g_viewRect.right - 1;
+	if (pt->y < g_viewRect.top)          pt->y = g_viewRect.top;
+	if (pt->y > g_viewRect.bottom - 1)   pt->y = g_viewRect.bottom - 1;
 }
 
 void Zoomer::UpdateLerp()
@@ -397,8 +399,8 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 		LOG("MOUSEWHEEL: screen=(%ld,%ld) client=(%ld,%ld)", screenPt.x, screenPt.y, clientPt.x, clientPt.y);
 
-		// The magnified view zooms only while Ctrl is held (Telescope gates
-		// its wheel zoom the same way); otherwise the game sees the wheel.
+		// The magnified view zooms only while Ctrl is held; otherwise the
+		// game sees the wheel.
 		if (CtrlHeld() && IsPointInMapArea(clientPt))
 		{
 			// The magnified view stays anchored at its center: the point under
@@ -410,35 +412,30 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 			g_focusValid = true;
 
 			const short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-			const int steps = delta / WHEEL_DELTA;
 
-			if (g_useGScript && g_pZoomFactor)
-			{
-				float curZoom = *g_pZoomFactor;
-				if (curZoom < ZOOM_MIN) curZoom = ZOOM_MIN;
-				if (curZoom > ZOOM_MAX) curZoom = ZOOM_MAX;
+			// Smooth scrolling hands out deltas smaller than WHEEL_DELTA:
+			// keep what is left over so the steps add up instead of being
+			// rounded away to zero.
+			g_wheelRemainder += delta;
+			const int steps = g_wheelRemainder / WHEEL_DELTA;
+			g_wheelRemainder %= WHEEL_DELTA;
 
-				curZoom = ApplyWheelSteps(curZoom, steps);
-				*g_pZoomFactor = curZoom;
-				LOG("GScript ZOOM: factor=%.3f", curZoom);
-			}
-			else
-			{
-				const float target = ApplyWheelSteps(g_targetZoom.load(), steps);
-				g_targetZoom.store(target);
+			const float target = ApplyWheelSteps(g_targetZoom.load(), steps);
+			g_targetZoom.store(target);
 
-				LOG("WM_MOUSEWHEEL delta=%d steps=%d target=%.3f", delta, steps, target);
-			}
+			LOG("WM_MOUSEWHEEL delta=%d steps=%d target=%.3f", delta, steps, target);
 
 			return 0;
 		}
 
+		// The wheel belongs to the game: start the remainder over, a later
+		// zoom gesture must not inherit what was collected here.
+		g_wheelRemainder = 0;
 		return CallWindowProc(OriginalWndProc, hWnd, msg, wParam, lParam);
 	}
 
-	// Double press Ctrl resets the zoom: telescope listens for the same
-	// WM_KEYDOWN of VK_CONTROL, ignoring the auto repeat bit. Ctrl itself is
-	// never consumed.
+	// Double press Ctrl resets the zoom: watch WM_KEYDOWN of VK_CONTROL,
+	// ignoring the auto repeat bit. Ctrl itself is never consumed.
 	if (msg == WM_KEYDOWN && wParam == VK_CONTROL && !(lParam & 0x40000000))
 	{
 		if (RegisterDoublePress(GetTickCount()))
@@ -447,7 +444,9 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 	if (msg == WM_KEYDOWN)
 	{
-		if (g_zoom.load() != ZOOM_DEFAULT && !CtrlHeld())
+		// Panning needs a zoom that is actually away from 1.0, the same snap
+		// epsilon the coordinate transforms are gated behind.
+		if (ZoomActive() && !CtrlHeld())
 		{
 			const int viewW = g_viewRect.right - g_viewRect.left;
 			const int viewH = g_viewRect.bottom - g_viewRect.top;
@@ -485,12 +484,12 @@ LRESULT CALLBACK Zoomer::NewWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM l
 
 	// Mouse messages pass through untouched: the game consumes the physical
 	// position and the coordinate transforms happen at the points where it
-	// turns a screen position into game space (see Main.cpp), exactly like
-	// Telescope does instead of remapping the message stream.
+	// turns a screen position into game space (see Main.cpp) instead of
+	// remapping the message stream.
 	return CallWindowProc(OriginalWndProc, hWnd, msg, wParam, lParam);
 }
 
-DWORD WINAPI Zoomer::InitThread(LPVOID lpParam)
+DWORD WINAPI Zoomer::InitThread(LPVOID)
 {
 	LOG("InitThread started, PID=%lu", GetCurrentProcessId());
 
@@ -528,54 +527,33 @@ DWORD WINAPI Zoomer::InitThread(LPVOID lpParam)
 	g_wndProcHooked = (OriginalWndProc != nullptr);
 	LOG("WndProc hook: %s (orig=%p)", g_wndProcHooked ? "OK" : "FAILED", OriginalWndProc);
 
-	HMODULE hGScript = GetModuleHandleA("GScript.ext");
-	if (!hGScript) hGScript = GetModuleHandleA("GScript.dll");
-	if (hGScript)
-	{
-		MODULEINFO modInfo = {};
-		if (GetModuleInformation(GetCurrentProcess(), hGScript, &modInfo, sizeof(modInfo)))
-		{
-			g_pZoomFactor = reinterpret_cast<float*>(
-				reinterpret_cast<BYTE*>(modInfo.lpBaseOfDll) + GSCRIPT_ZOOM_FACTOR_RVA);
+	// GScript.ext is no longer supported: ViewCtrl always owns the zoom. If
+	// the module is present anyway, both extensions would magnify at once.
+	if (GetModuleHandleA("GScript.ext") || GetModuleHandleA("GScript.dll"))
+		LOG("WARNING: GScript.ext detected - ViewCtrl no longer delegates the zoom; disable one of the two");
 
-			DWORD oldProtect = 0;
-			if (VirtualProtect(g_pZoomFactor, sizeof(float), PAGE_READWRITE, &oldProtect))
-			{
-				g_useGScript = true;
-				LOG("GScript.ext found at %p, zoom_factor at %p (base+0x%X)",
-					modInfo.lpBaseOfDll, g_pZoomFactor, GSCRIPT_ZOOM_FACTOR_RVA);
-			}
-			else
-			{
-				LOG("GScript.ext found but VirtualProtect failed for zoom_factor");
-			}
-		}
-	}
-	else
-	{
-		LOG("GScript.ext not found — using the in game zoom");
-	}
+	GameCamera::Enable();
 
-	if (g_useGScript)
-	{
-		LOG("GScript mode: game camera control and render zoom stay disabled");
-	}
-	else
-	{
-		GameCamera::Enable();
-	}
+	RenderZoom::Init();
 
-	RenderZoom::Init(!g_useGScript);
-
-	ShowCursor(FALSE);
 	g_initialized = g_wndProcHooked;
-	LOG("Init complete: g_initialized=%d useGScript=%d", g_initialized, g_useGScript);
+	LOG("Init complete: g_initialized=%d", g_initialized);
 
 	return 0;
 }
 
 void Zoomer::Init()
 {
+	// The Syringe startup hook may fire more than once: a second thread
+	// would subclass the window proc again and Shutdown could only restore
+	// our own handler.
+	if (g_initStarted)
+	{
+		LOG("Init() ignored — already started");
+		return;
+	}
+	g_initStarted = true;
+
 	LOG("Init() called — creating init thread");
 	g_hThread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
 }
@@ -605,16 +583,13 @@ void Zoomer::Shutdown()
 
 	RenderZoom::Shutdown();
 
-	if (g_initialized)
-	{
-		ShowCursor(TRUE);
-	}
-
 	g_hWnd = nullptr;
 	g_zoom.store(ZOOM_DEFAULT);
 	g_targetZoom.store(ZOOM_DEFAULT);
 	g_invZoom.store(1.0f);
 	g_initialized = false;
+	g_initStarted = false;
+	g_wheelRemainder = 0;
 	g_perfCounterReady = false;
 	g_lastLerpTime = {};
 	g_perfFrequency = {};
@@ -622,8 +597,6 @@ void Zoomer::Shutdown()
 	g_centerX = (g_viewRect.left + g_viewRect.right) / 2;
 	g_centerY = (g_viewRect.top + g_viewRect.bottom) / 2;
 	g_viewRectFromGame = false;
-	g_useGScript = false;
-	g_pZoomFactor = nullptr;
 
 	LOG("Shutdown complete");
 }

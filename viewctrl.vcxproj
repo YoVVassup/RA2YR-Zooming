@@ -51,16 +51,14 @@
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <GenerateManifest>false</GenerateManifest>
-    <IncludePath>$(SolutionDir)src;$(SolutionDir)MinHook\include;$(SolutionDir)YRpp;$(VC_IncludePath)</IncludePath>
-    <LibraryPath>$(SolutionDir)MinHook\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(SolutionDir)src;$(SolutionDir)YRpp;$(VC_IncludePath)</IncludePath>
     <LinkIncremental>true</LinkIncremental>
     <OutDir>$(Configuration)\</OutDir>
     <IntDir>$(Configuration)\IntDir\</IntDir>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
     <GenerateManifest>false</GenerateManifest>
-    <IncludePath>$(SolutionDir)src;$(SolutionDir)MinHook\include;$(SolutionDir)YRpp;$(VC_IncludePath)</IncludePath>
-    <LibraryPath>$(SolutionDir)MinHook\lib;$(LibraryPath)</LibraryPath>
+    <IncludePath>$(SolutionDir)src;$(SolutionDir)YRpp;$(VC_IncludePath)</IncludePath>
     <LinkIncremental>false</LinkIncremental>
     <OutDir>$(Configuration)\</OutDir>
     <IntDir>$(Configuration)\IntDir\</IntDir>
@@ -70,11 +68,12 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
-      <SDLCheck>true</SDLCheck>
+      <SDLCheck>false</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <DiagnosticsFormat>Caret</DiagnosticsFormat>
       <PreprocessorDefinitions>DEBUG;SYR_VER=2;WIN32;VIEWCTRL_EXPORTS;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <BufferSecurityCheck>false</BufferSecurityCheck>
@@ -84,9 +83,9 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <EnableCOMDATFolding>true</EnableCOMDATFolding>
-      <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>ddraw.lib;user32.lib;gdi32.lib;opengl32.lib;d3d9.lib;libMinHook.x86.lib;dxguid.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <EnableCOMDATFolding>false</EnableCOMDATFolding>
+      <OptimizeReferences>false</OptimizeReferences>
+      <AdditionalDependencies>user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -94,11 +93,12 @@
       <WarningLevel>Level3</WarningLevel>
       <Optimization>Disabled</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
-      <SDLCheck>true</SDLCheck>
+      <SDLCheck>false</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <DiagnosticsFormat>Caret</DiagnosticsFormat>
       <PreprocessorDefinitions>SYR_VER=2;WIN32;NDEBUG;VIEWCTRL_EXPORTS;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <BufferSecurityCheck>false</BufferSecurityCheck>
@@ -111,16 +111,16 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
-      <AdditionalDependencies>ddraw.lib;user32.lib;gdi32.lib;opengl32.lib;d3d9.lib;libMinHook.x86.lib;dxguid.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>user32.lib;gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="src\Main.hpp" />
+    <ClInclude Include="src\ScalerConflict.hpp" />
     <ClInclude Include="src\Zoomer.hpp" />
     <ClInclude Include="src\GameCamera.hpp" />
     <ClInclude Include="src\RenderZoom.hpp" />
     <ClInclude Include="src\Log.h" />
-    <ClInclude Include="MinHook\include\MinHook.h" />
     <ClInclude Include="YRpp\Helpers\Cast.h" />
     <ClInclude Include="YRpp\Helpers\CompileTime.h" />
     <ClInclude Include="YRpp\Helpers\Enumerators.h" />
@@ -134,15 +134,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\Main.cpp" />
+    <ClCompile Include="src\ScalerConflict.cpp" />
     <ClCompile Include="src\Zoomer.cpp" />
     <ClCompile Include="src\GameCamera.cpp" />
     <ClCompile Include="src\RenderZoom.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\ViewCtrl.rc" />
-  </ItemGroup>
-  <ItemGroup>
-    <Library Include="MinHook\lib\libMinHook.x86.lib" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
