@@ -63,5 +63,11 @@
     <ClInclude Include="doctest.h" />
     <ClInclude Include="mock_window.h" />
   </ItemGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <PreBuildEvent>
+      <Command>cl /nologo /LD /MDd /EHsc /Fo:"$(ProjectDir)obj\l5_export_stub.obj" /Fe:"$(ProjectDir)bin\l5_export_stub.dll" "$(ProjectDir)l5_export_stub.cpp" /link /DLL /NOIMPLIB /NODEFAULTLIB:libcmt</Command>
+      <Message>Building L5 export stub DLL for tests</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

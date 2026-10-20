@@ -43,5 +43,9 @@ namespace GameCamera
 	void EnableForTest();
 	void SetTacticalInstanceForTest(void* instance);
 	void SetCameraPositionForTest(void* fn);
+	// Points the Enable() prologue probe at a buffer the test owns, so both
+	// the success and the unexpected-prologue paths can run outside the game.
+	// Pass null to restore the real SetCameraPosition address.
+	void SetCameraProbeAddressForTest(const void* address);
 #endif
 }

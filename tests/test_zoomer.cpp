@@ -15,6 +15,11 @@
 #include "../src/Log.h"
 #include "mock_window.h"
 
+// Exported so ModuleExportsScaler / Present()'s L5 path can see a real
+// export table under the unit tests (the undecorated form of GScript's
+// _exfunc_get_zoom_factor@0).
+extern "C" __declspec(dllexport) float exfunc_get_zoom_factor() { return 1.0f; }
+
 // Main.cpp test seam: the sidebar flag byte the PostRender hook reads.
 void SetFlagByteForTest(const BYTE* p);
 
@@ -1637,7 +1642,7 @@ TEST_CASE("Hook: ViewCtrlPreRenderRestore") {
         CHECK(R.CL() == 1u);
     }
 
-    SUBCASE("a backup that cannot be restored forces EAX=2") {
+    SUBCASE("the frame after a magnified one is repainted even without the game data") {
         FakeGameRegion game;
         REQUIRE(game.Create(400, 300));
         game.FillPattern();
@@ -1645,12 +1650,15 @@ TEST_CASE("Hook: ViewCtrlPreRenderRestore") {
         Zoomer::g_zoom.store(2.0f);
         Zoomer::g_targetZoom.store(2.0f);
         RenderZoom::SetEnabled(true);
+        REQUIRE(RenderZoom::PreRender() == true);
         RenderZoom::PostRender();
-        REQUIRE(game.surface->locks == 0);
 
-        // Take the surface away: the restore fails and the frame is declared
-        // dirty even though the pixels were never put back.
+        // Take the surface away and zoom back: the stretch of the last
+        // frame is still conceptually on screen, so the vanilla frame is
+        // declared dirty even though nothing can be unsubstituted now.
         RenderZoom::SetTestGameRegion(nullptr, nullptr, nullptr, nullptr);
+        Zoomer::g_zoom.store(1.0f);
+        Zoomer::g_targetZoom.store(1.0f);
 
         REGISTERS R{};
         R.EAX(5u);
@@ -1956,29 +1964,46 @@ TEST_CASE("RenderZoom: observes the game view rect through the fake region") {
     }
 }
 
-TEST_CASE("RenderZoom: PostRender magnifies, PreRender restores") {
+TEST_CASE("RenderZoom: PreRender substitutes, PostRender stretches") {
     TestableZoomer::ResetState();
     RenderZoom::SetEnabled(true);
 
     FakeGameRegion game;
     REQUIRE(game.Create(800, 600));
+    game.SetView(0, 0, 400, 300); // matches Zoomer::ViewRect below
     game.FillPattern();
     Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
     Zoomer::g_zoom.store(2.0f);
     Zoomer::g_targetZoom.store(2.0f);
 
-    RenderZoom::PostRender();
-    REQUIRE(game.surface->locks == 0);
-
     const RenderZoom::SourceRect src =
         RenderZoom::ComputeSourceRect(400, 300, 200, 150, 2.0f);
 
-    SUBCASE("the view rect holds the magnified source pixels") {
-        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(src.X, src.Y));
+    SUBCASE("PreRender substitutes the view dimensions with the source rect") {
+        CHECK(RenderZoom::PreRender() == true);
+        CHECK(game.viewBounds[0] == 0);   // the origin stays vanilla
+        CHECK(game.viewBounds[1] == 0);
+        CHECK(game.viewBounds[2] == src.W);
+        CHECK(game.viewBounds[3] == src.H);
+    }
+
+    REQUIRE(RenderZoom::PreRender() == true);
+    RenderZoom::PostRender();
+    REQUIRE(game.surface->locks == 0);
+
+    SUBCASE("PostRender restores the vanilla view dimensions") {
+        CHECK(game.viewBounds[2] == 400);
+        CHECK(game.viewBounds[3] == 300);
+    }
+
+    SUBCASE("the view rect holds the stretched source pixels") {
+        // The engine rendered the source rect at the view origin; the
+        // stretch maps it over the full 400x300 view.
+        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
         CHECK(game.At(399, 299) ==
-            FakeGameRegion::PatternAt(src.X + src.W - 1, src.Y + src.H - 1));
-        // The anchor maps onto itself.
-        CHECK(game.At(200, 150) == FakeGameRegion::PatternAt(200, 150));
+            FakeGameRegion::PatternAt(src.W - 1, src.H - 1));
+        // The view center samples the source center.
+        CHECK(game.At(200, 150) == FakeGameRegion::PatternAt(src.W / 2, src.H / 2));
     }
 
     SUBCASE("pixels outside the view rect stay untouched") {
@@ -1986,31 +2011,121 @@ TEST_CASE("RenderZoom: PostRender magnifies, PreRender restores") {
         CHECK(game.At(500, 100) == FakeGameRegion::PatternAt(500, 100));
     }
 
-    SUBCASE("PreRender puts the original pixels back without a repaint") {
-        CHECK(RenderZoom::PreRender() == false);
-        CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
-        CHECK(game.At(399, 299) == FakeGameRegion::PatternAt(399, 299));
-        // A second frame without a backup changes nothing.
+    SUBCASE("a magnified frame keeps substituting and forcing repaints") {
+        CHECK(RenderZoom::PreRender() == true);
+        RenderZoom::PostRender();
+        CHECK(game.viewBounds[2] == 400);
+        CHECK(game.viewBounds[3] == 300);
+        CHECK(game.surface->locks == 0);
+    }
+
+    SUBCASE("the first vanilla frame after a magnified one repaints everything") {
+        Zoomer::g_zoom.store(1.0f);
+        Zoomer::g_targetZoom.store(1.0f);
+        CHECK(RenderZoom::PreRender() == true);
+        // ...and the one after that is vanilla again.
         CHECK(RenderZoom::PreRender() == false);
     }
+}
+
+TEST_CASE("RenderZoom: the substitution never leaks between frames") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600));
+    Zoomer::SetViewRect({ 0, 0, 640, 400 }, true);
+    Zoomer::g_zoom.store(2.0f);
+    Zoomer::g_targetZoom.store(2.0f);
+
+    REQUIRE(RenderZoom::PreRender() == true);
+    CHECK(game.viewBounds[2] != 640);
+
+    // Even a PostRender that fails to lock (no stretch) still unsubstitutes.
+    game.surface->bpp = 3;
+    RenderZoom::PostRender();
+    CHECK(game.viewBounds[2] == 640);
+    CHECK(game.viewBounds[3] == 400);
+
+    // A frame that never reached PostRender at all is cleaned up by the
+    // next PreRender: the substitution is dropped and the frame repainted.
+    REQUIRE(RenderZoom::PreRender() == true); // substituted again
+    CHECK(game.viewBounds[2] != 640);
+    Zoomer::g_zoom.store(1.0f);
+    Zoomer::g_targetZoom.store(1.0f);
+    CHECK(RenderZoom::PreRender() == true);
+    CHECK(game.viewBounds[2] == 640);
+    CHECK(game.viewBounds[3] == 400);
+}
+
+TEST_CASE("RenderZoom: a read-only view bounds region rejects the substitution") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600));
+    Zoomer::SetViewRect({ 0, 0, 640, 400 }, true);
+    Zoomer::g_zoom.store(2.0f);
+    Zoomer::g_targetZoom.store(2.0f);
+
+    // The dimensions can be read (IsGameReadable passes) but not written:
+    // the store is rejected instead of faulting on the protected page.
+    DWORD oldProt = 0;
+    REQUIRE(VirtualProtect(game.base, 4096, PAGE_READONLY, &oldProt));
+    CHECK(RenderZoom::PreRender() == false);
+    CHECK(game.viewBounds[2] == 640);
+    CHECK(game.viewBounds[3] == 400);
+    VirtualProtect(game.base, 4096, oldProt, &oldProt);
+}
+
+TEST_CASE("RenderZoom: disables itself when a world-space scaler rescales the view") {
+    TestableZoomer::ResetState();
+    ScalerConflict::ResetReactive();
+    RenderZoom::SetEnabled(true);
+
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600)); // view 640x400, window 800x600
+
+    // The first frame establishes the vanilla baseline.
+    CHECK(RenderZoom::PreRender() == false);
+    CHECK(RenderZoom::IsEnabled() == true);
+
+    // A foreign world-space scaler (GScript, Kaleidoscope, MOExperience)
+    // holds a displaced view for longer than the persist window.
+    ScalerConflict::ObserveViewDims(800, 600, 320, 200, GetTickCount());
+    ScalerConflict::ObserveViewDims(800, 600, 320, 200, GetTickCount() + 2000);
+    REQUIRE(ScalerConflict::ReactiveConflict());
+
+    CHECK(RenderZoom::PreRender() == false);
+    CHECK(RenderZoom::IsEnabled() == false);
+
+    // The hooks go inert with it.
+    REGISTERS R{};
+    R.EAX(7u);
+    CHECK(ViewCtrlPreRenderRestore(&R) == 0x4F44B4);
+    CHECK(R.EAX() == 7u);
+
+    ScalerConflict::ResetReactive();
 }
 
 TEST_CASE("RenderZoom: lock rejections leave the frame alone") {
     TestableZoomer::ResetState();
     RenderZoom::SetEnabled(true);
 
-    SUBCASE("a 24 bit surface is not backed up") {
+    SUBCASE("a 24 bit surface is not stretched") {
         FakeGameRegion game;
         REQUIRE(game.Create(800, 600));
+        game.SetView(0, 0, 400, 300);
         game.FillPattern();
         game.surface->bpp = 3;
         Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
         Zoomer::g_zoom.store(2.0f);
         Zoomer::g_targetZoom.store(2.0f);
 
+        REQUIRE(RenderZoom::PreRender() == true); // substituted regardless
         RenderZoom::PostRender();
         CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
-        CHECK(RenderZoom::PreRender() == false);
+        CHECK(game.viewBounds[2] == 400); // still unsubstituted
     }
 
     SUBCASE("a view rect wider than the surface is rejected") {
@@ -2021,9 +2136,10 @@ TEST_CASE("RenderZoom: lock rejections leave the frame alone") {
         Zoomer::g_zoom.store(2.0f);
         Zoomer::g_targetZoom.store(2.0f);
 
+        REQUIRE(RenderZoom::PreRender() == true);
         RenderZoom::PostRender();
         CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
-        CHECK(RenderZoom::PreRender() == false);
+        CHECK(game.surface->locks == 0);
     }
 
     SUBCASE("an odd pitch is rejected") {
@@ -2035,6 +2151,7 @@ TEST_CASE("RenderZoom: lock rejections leave the frame alone") {
         Zoomer::g_zoom.store(2.0f);
         Zoomer::g_targetZoom.store(2.0f);
 
+        REQUIRE(RenderZoom::PreRender() == true);
         RenderZoom::PostRender();
         CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
     }
@@ -2042,18 +2159,20 @@ TEST_CASE("RenderZoom: lock rejections leave the frame alone") {
     SUBCASE("a pitch below the view right edge fails CopyRows and unlocks") {
         FakeGameRegion game;
         REQUIRE(game.Create(800, 600));
+        game.SetView(0, 0, 400, 300);
         game.FillPattern();
-        // Positive and even, so LockView accepts it, but below
-        // view.right * 2, so CopyRows refuses to walk the rows.
+        // Positive and even, so LockView accepts it, but below the drawn
+        // region's right edge, so CopyRows refuses to walk the rows.
         game.surface->pitch = 100;
         Zoomer::SetViewRect({ 0, 0, 400, 300 }, true);
         Zoomer::g_zoom.store(2.0f);
         Zoomer::g_targetZoom.store(2.0f);
 
+        REQUIRE(RenderZoom::PreRender() == true);
         RenderZoom::PostRender();
         CHECK(game.surface->locks == 0);
         CHECK(game.At(0, 0) == FakeGameRegion::PatternAt(0, 0));
-        CHECK(RenderZoom::PreRender() == false);
+        CHECK(game.viewBounds[2] == 400);
     }
 }
 
@@ -2414,6 +2533,9 @@ namespace
         }
     };
 
+    // Minimal PE32 DLL with a single named export — replaced by the
+    // prebuilt l5_export_stub.dll helper; see Present() L5 test below.
+
     // Minimal mapped-style PE image whose .syhks00 holds hookdecl entries
     // ({addr, size, name ptr, pad} = 16 bytes on x86). `wrongSection` puts
     // the table behind a differently named section instead.
@@ -2499,12 +2621,40 @@ TEST_CASE("ScalerConflict: known scaler module names") {
     CHECK(ScalerConflict::IsScalerModuleName(L"GSCRIPT.EXT"));
     CHECK(ScalerConflict::IsScalerModuleName(L"Telescope.dll"));
     CHECK(ScalerConflict::IsScalerModuleName(L"telescope.DLL"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"MOExperience.dll"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"moexperience.dll"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"Kaleidoscope.dll"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"kaleidoscope.DLL"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"Ra2VampireZoom.Loader.dll"));
+    CHECK(ScalerConflict::IsScalerModuleName(L"ra2vampirezoom.loader.DLL"));
 
     CHECK(!ScalerConflict::IsScalerModuleName(L"Phobos.ext"));
     CHECK(!ScalerConflict::IsScalerModuleName(L"Ares.dll"));
+    CHECK(!ScalerConflict::IsScalerModuleName(L"cnc-ddraw.dll"));
     CHECK(!ScalerConflict::IsScalerModuleName(L"ViewCtrl.dll"));
     CHECK(!ScalerConflict::IsScalerModuleName(L""));
     CHECK(!ScalerConflict::IsScalerModuleName(nullptr));
+}
+
+TEST_CASE("ScalerConflict: known scaler export names") {
+    // L5: GScript's script-facing zoom API, stdcall-decorated and plain.
+    CHECK(ScalerConflict::IsScalerExportName("_exfunc_get_zoom_factor@0"));
+    CHECK(ScalerConflict::IsScalerExportName("exfunc_get_zoom_factor"));
+
+    CHECK(!ScalerConflict::IsScalerExportName("_exfunc_get_zoom_factor"));
+    CHECK(!ScalerConflict::IsScalerExportName("_exfunc_is_in_game@0"));
+    CHECK(!ScalerConflict::IsScalerExportName("DllGetClassObject"));
+    CHECK(!ScalerConflict::IsScalerExportName(""));
+    CHECK(!ScalerConflict::IsScalerExportName(nullptr));
+}
+
+TEST_CASE("ScalerConflict: ModuleExportsScaler rejects foreign modules") {
+    // kernel32 and any module without scaler exports stay clean. (The
+    // test executable itself exports the undecorated zoom API for the L5
+    // positive cases below, so it is not a negative sample.)
+    CHECK(!ScalerConflict::ModuleExportsScaler(GetModuleHandleW(L"kernel32.dll")));
+    CHECK(!ScalerConflict::ModuleExportsScaler(GetModuleHandleW(L"user32.dll")));
+    CHECK(!ScalerConflict::ModuleExportsScaler(nullptr));
 }
 
 TEST_CASE("ScalerConflict: own .syhks00 declares the nine hook sites") {
@@ -2562,12 +2712,32 @@ TEST_CASE("ScalerConflict: .syhks00 share separates co-hookers from scalers") {
 
     // Degenerate inputs.
     CHECK(!ScalerConflict::ImageClaimsScalerShare(nullptr, sites, n));
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(threeSites.bytes.data(), sites, n, 0));
     CHECK(!ScalerConflict::ImageClaimsScalerShare(threeSites.bytes.data(), sites, 0));
     CHECK(!ScalerConflict::ImageClaimsScalerShare(threeSites.bytes.data(), nullptr, n));
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(threeSites.bytes.data(), sites, 2, 3));
+}
+
+TEST_CASE("ScalerConflict: ImageClaimsScalerShare honours the minClaimed threshold") {
+    unsigned int sites[16] = {};
+    const unsigned int n = ScalerConflict::OwnHookSites(sites, 16);
+    REQUIRE(n == 9);
+
+    // Present() asks for a single one of the eight fingerprint sites.
+    FakeSyringeImage oneSite({ sites[1] });
+    CHECK(ScalerConflict::ImageClaimsScalerShare(oneSite.bytes.data(), sites, n, 1));
+    CHECK(!ScalerConflict::ImageClaimsScalerShare(oneSite.bytes.data(), sites, n, 2));
+
+    // The Ares site alone never counts: Present() filters it out before the
+    // scan, and the full-sites call keeps the old three-site bar.
+    FakeSyringeImage aresOnly({ 0x52CAE9u });
+    CHECK(ScalerConflict::ImageClaimsScalerShare(aresOnly.bytes.data(), sites, n, 1));
 }
 
 TEST_CASE("ScalerConflict: a clean process reports no conflict") {
     CHECK(ScalerConflict::Present() == false);
+    CHECK(ScalerConflict::RuntimePatchPresent() == false);
+    CHECK(ScalerConflict::ReactiveConflict() == false);
 }
 
 TEST_CASE("ScalerConflict: Present() detects a loaded scaler") {
@@ -2587,6 +2757,158 @@ TEST_CASE("ScalerConflict: Present() detects a loaded scaler") {
     CHECK(ScalerConflict::Present());
     byClaim.Unmap();
     CHECK(!ScalerConflict::Present());
+}
+
+TEST_CASE("ScalerConflict: DecodeJumpTarget") {
+    uintptr_t target = 0;
+
+    SUBCASE("a rel32 JMP decodes to its absolute target") {
+        const uintptr_t site = 0x1000;
+        const unsigned char jmp[5] = { 0xE9, 0x10, 0x00, 0x00, 0x00 };
+        CHECK(ScalerConflict::DecodeJumpTarget(jmp, site, target));
+        CHECK(target == 0x1015u); // site + 5 + 0x10
+    }
+
+    SUBCASE("a negative displacement decodes too") {
+        const uintptr_t site = 0x2000;
+        const unsigned char jmp[5] = { 0xE9, 0xF6, 0xFF, 0xFF, 0xFF };
+        CHECK(ScalerConflict::DecodeJumpTarget(jmp, site, target));
+        CHECK(target == 0x1FFBu); // site + 5 - 10
+    }
+
+    SUBCASE("anything but 0xE9 is not a jump") {
+        const unsigned char nop[5] = { 0x90, 0x90, 0x90, 0x90, 0x90 };
+        CHECK(!ScalerConflict::DecodeJumpTarget(nop, 0x1000, target));
+
+        const unsigned char indirect[5] = { 0xFF, 0x25, 0x00, 0x00, 0x00 };
+        CHECK(!ScalerConflict::DecodeJumpTarget(indirect, 0x1000, target));
+
+        CHECK(!ScalerConflict::DecodeJumpTarget(nullptr, 0x1000, target));
+    }
+}
+
+TEST_CASE("ScalerConflict: SiteHookedForeign") {
+    // The five bytes live in a buffer the test owns; only the jump target
+    // decides.
+    unsigned char site[5] = {};
+
+    auto WriteJumpTo = [&](uintptr_t target) {
+        site[0] = 0xE9;
+        const int rel32 = static_cast<int>(
+            static_cast<intptr_t>(target) - static_cast<intptr_t>(
+                reinterpret_cast<uintptr_t>(site) + 5));
+        std::memcpy(site + 1, &rel32, sizeof(rel32));
+    };
+
+    SUBCASE("an unreadable site is not foreign") {
+        CHECK(!ScalerConflict::SiteHookedForeign(0x10u)); // the zero page
+    }
+
+    SUBCASE("non-JMP bytes are not foreign") {
+        site[0] = 0x90;
+        CHECK(!ScalerConflict::SiteHookedForeign(reinterpret_cast<uintptr_t>(site)));
+    }
+
+    SUBCASE("a JMP into a foreign module is foreign") {
+        FakeScaler foreign(MakeFakeScalerFile(L"ScalerClaim.dll"));
+        REQUIRE(!foreign.path.empty());
+        REQUIRE(foreign.Map());
+
+        WriteJumpTo(reinterpret_cast<uintptr_t>(foreign.mod));
+        CHECK(ScalerConflict::SiteHookedForeign(reinterpret_cast<uintptr_t>(site)));
+    }
+
+    SUBCASE("a JMP into our own image is not foreign") {
+        // The test executable is both "self" and the host exe.
+        WriteJumpTo(reinterpret_cast<uintptr_t>(&ScalerConflict::Present));
+        CHECK(!ScalerConflict::SiteHookedForeign(reinterpret_cast<uintptr_t>(site)));
+    }
+
+    SUBCASE("a JMP into unallocated memory is not foreign") {
+        // Conservative: Syringe's dispatcher stubs may live outside any
+        // module, and a jump there is our own hook.
+        void* region = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
+            PAGE_READWRITE);
+        REQUIRE(region != nullptr);
+        const uintptr_t target = reinterpret_cast<uintptr_t>(region) + 0x800;
+        VirtualFree(region, 0, MEM_RELEASE);
+
+        WriteJumpTo(target);
+        CHECK(!ScalerConflict::SiteHookedForeign(reinterpret_cast<uintptr_t>(site)));
+    }
+}
+
+TEST_CASE("ScalerConflict: reactive watch (L4)") {
+    ScalerConflict::ResetReactive();
+
+    SUBCASE("the first observation is only a baseline") {
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 0);
+        CHECK(!ScalerConflict::ReactiveConflict());
+    }
+
+    SUBCASE("a matching view never conflicts, however long it holds") {
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 0);
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 50000);
+        CHECK(!ScalerConflict::ReactiveConflict());
+    }
+
+    SUBCASE("a displacement shorter than the persist window is transient") {
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 0);
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 500);
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 600); // back
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 700); // restarted
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 1600); // 900ms pending
+        CHECK(!ScalerConflict::ReactiveConflict());
+    }
+
+    SUBCASE("a view held displaced past the persist window conflicts") {
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 0);
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 100);
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 1100);
+        CHECK(ScalerConflict::ReactiveConflict());
+    }
+
+    SUBCASE("the conflict is sticky until reset") {
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 0);
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 0);
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 2000);
+        REQUIRE(ScalerConflict::ReactiveConflict());
+
+        // Even a back-to-baseline view cannot clear it mid-game.
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 4000);
+        CHECK(ScalerConflict::ReactiveConflict());
+
+        ScalerConflict::ResetReactive();
+        CHECK(!ScalerConflict::ReactiveConflict());
+    }
+
+    SUBCASE("a window resize re-baselines instead of conflicting") {
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 0);
+        // The user resizes: window and view both move, no conflict...
+        ScalerConflict::ObserveViewDims(1024, 768, 864, 608, 100);
+        CHECK(!ScalerConflict::ReactiveConflict());
+        // ...and the new pair is the baseline from here on.
+        ScalerConflict::ObserveViewDims(1024, 768, 864, 608, 5000);
+        CHECK(!ScalerConflict::ReactiveConflict());
+        // A displacement relative to the new baseline still conflicts.
+        ScalerConflict::ObserveViewDims(1024, 768, 400, 300, 5100);
+        ScalerConflict::ObserveViewDims(1024, 768, 400, 300, 7000);
+        CHECK(ScalerConflict::ReactiveConflict());
+    }
+
+    SUBCASE("observations after a conflict are ignored") {
+        ScalerConflict::ObserveViewDims(800, 600, 640, 400, 0);
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 0);
+        ScalerConflict::ObserveViewDims(800, 600, 320, 200, 2000);
+        REQUIRE(ScalerConflict::ReactiveConflict());
+
+        // A fresh watch is only reachable through ResetReactive; the sticky
+        // flag wins over every later observation.
+        ScalerConflict::ObserveViewDims(1, 1, 1, 1, 99999);
+        CHECK(ScalerConflict::ReactiveConflict());
+    }
+
+    ScalerConflict::ResetReactive();
 }
 
 TEST_CASE("GameInt: stays inert while a conflicting scaler is loaded") {
@@ -2609,5 +2931,206 @@ TEST_CASE("GameInt: stays inert while a conflicting scaler is loaded") {
     CHECK(TestableZoomer::g_hThread != nullptr);
     WaitForSingleObject(TestableZoomer::g_hThread, 2000);
     TestableZoomer::Shutdown();
+}
+
+// ==================== Coverage: previously unreachable defensive paths ====================
+
+TEST_CASE("Log: disabled branch is a no-op") {
+    Debug::SetLogEnabledForTest(false);
+    CHECK(Debug::LogEnabled() == false);
+    Debug::Log("this must not be written"); // hits the early return
+    Debug::SetLogEnabledForTest(true);
+    CHECK(Debug::LogEnabled() == true);
+}
+
+TEST_CASE("GameCamera: Enable probes the entry-point prologue") {
+    TestableZoomer::ResetState();
+    GameCamera::Disable();
+
+    // A buffer inside this process image: GetModuleHandleEx succeeds, but
+    // the first byte is not `sub esp, 8`.
+    static unsigned char probe[16] = { 0x90, 0 };
+    GameCamera::SetCameraProbeAddressForTest(probe);
+    GameCamera::Enable();
+    CHECK(GameCamera::IsEnabled() == false);
+
+    // Correct prologue: Enable arms the wrapper.
+    probe[0] = 0x83;
+    GameCamera::Enable();
+    CHECK(GameCamera::IsEnabled() == true);
+    GameCamera::Disable();
+    CHECK(GameCamera::IsEnabled() == false);
+
+    GameCamera::SetCameraProbeAddressForTest(nullptr);
+    GameCamera::Enable(); // real address outside gamemd: refuses again
+    CHECK(GameCamera::IsEnabled() == false);
+}
+
+TEST_CASE("ScalerConflict: ModuleExportsScaler finds a real export") {
+    // The test executable exports the undecorated GScript zoom API.
+    CHECK(ScalerConflict::ModuleExportsScaler(GetModuleHandleW(nullptr)));
+}
+
+TEST_CASE("ScalerConflict: Present() L5 catches a renamed module with the export") {
+    // A real foreign DLL that exports the undecorated GScript zoom API but is
+    // not in the known scaler name list.
+    wchar_t stubPath[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, stubPath, MAX_PATH);
+    if (wchar_t* slash = wcsrchr(stubPath, L'\\'))
+        *(slash + 1) = L'\0';
+    wcscat_s(stubPath, L"l5_export_stub.dll");
+
+    HMODULE dll = LoadLibraryW(stubPath);
+    REQUIRE_MESSAGE(dll != nullptr, "l5_export_stub.dll missing from test bin");
+    CHECK(ScalerConflict::ModuleExportsScaler(dll));
+
+    // Present() walks the module list; the L5 probe fires under an unknown name.
+    CHECK(ScalerConflict::Present());
+
+    FreeLibrary(dll);
+    CHECK(!ScalerConflict::Present());
+}
+
+TEST_CASE("ScalerConflict: OwnImage / snapshot failure branches") {
+    ScalerConflict::SetFailOwnImageForTest(true);
+    unsigned int sites[16] = {};
+    CHECK(ScalerConflict::OwnHookSites(sites, 16) == 0);
+    ScalerConflict::SetFailOwnImageForTest(false);
+    CHECK(ScalerConflict::OwnHookSites(sites, 16) == 9);
+}
+
+namespace {
+    // Under OpenCppCoverage instrumentation the low 4MB is often taken, so
+    // a fixed VirtualAlloc at one fingerprint site can fail. Try several.
+    // The JMP target must land in a module that is NOT the test exe /
+    // ViewCtrl / gamemd, otherwise SiteHookedForeign treats it as our own
+    // hook. Under instrumentation GetProcAddress can resolve through a
+    // trampoline inside the main module, so we target l5_export_stub.dll.
+    struct PatchedSite {
+        uintptr_t site = 0;
+        unsigned char* at = nullptr;
+        void* page = nullptr;
+        HMODULE stub = nullptr;
+        uintptr_t target = 0;
+
+        bool Plant()
+        {
+            wchar_t stubPath[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, stubPath, MAX_PATH);
+            if (wchar_t* slash = wcsrchr(stubPath, L'\\'))
+                *(slash + 1) = L'\0';
+            wcscat_s(stubPath, L"l5_export_stub.dll");
+            stub = LoadLibraryW(stubPath);
+            if (!stub) return false;
+            target = reinterpret_cast<uintptr_t>(
+                GetProcAddress(stub, "exfunc_get_zoom_factor"));
+            if (!target) return false;
+
+            static const uintptr_t candidates[] = {
+                0x4F44AFu, 0x4F451Bu, 0x6D9F80u, 0x6D9FC0u,
+                0x692325u, 0x6D864Eu, 0x6D868Au, 0x693791u,
+            };
+            for (uintptr_t s : candidates)
+            {
+                const uintptr_t p = s & ~uintptr_t(0xFFF);
+                void* alloc = VirtualAlloc(reinterpret_cast<void*>(p), 0x1000,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+                if (!alloc) continue;
+                site = s;
+                page = alloc;
+                at = reinterpret_cast<unsigned char*>(s);
+                at[0] = 0xE9;
+                const int rel32 = static_cast<int>(
+                    static_cast<intptr_t>(target - (s + 5)));
+                std::memcpy(at + 1, &rel32, sizeof(rel32));
+                return true;
+            }
+            return false;
+        }
+        ~PatchedSite()
+        {
+            if (at) std::memset(at, 0x90, 5);
+            if (page) VirtualFree(page, 0, MEM_RELEASE);
+            if (stub) FreeLibrary(stub);
+        }
+    };
+}
+
+TEST_CASE("ScalerConflict: RuntimePatchPresent true when a site is foreign-patched") {
+    // Plant an E9 at a fingerprint site that lands in a foreign module
+    // (kernel32). Tries several sites: instrumentation can block fixed allocs.
+    PatchedSite patch;
+    if (!patch.Plant())
+    {
+        MESSAGE("no fingerprint page free under instrumentation; skipping");
+        return;
+    }
+
+    CHECK(ScalerConflict::RuntimePatchPresent() == true);
+    // destructor restores and frees
+}
+
+TEST_CASE("ScalerConflict: RuntimePatchPresent false on a clean image") {
+    CHECK(ScalerConflict::RuntimePatchPresent() == false);
+}
+
+TEST_CASE("RenderZoom: PreRender disables on a runtime foreign patch") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+    RenderZoom::ResetFrameState();
+
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600));
+    game.FillPattern();
+
+    Zoomer::SetViewRect({ 0, 0, 640, 400 }, true);
+    Zoomer::g_zoom.store(2.0f);
+    Zoomer::g_targetZoom.store(2.0f);
+
+    // First frame substitutes normally.
+    REQUIRE(RenderZoom::PreRender() == true);
+    CHECK(game.viewBounds[2] != 640);
+
+    // Plant a foreign JMP at a fingerprint site, force the next scan.
+    PatchedSite patch;
+    if (!patch.Plant())
+    {
+        RenderZoom::PostRender();
+        MESSAGE("no fingerprint page free under instrumentation; skipping");
+        return;
+    }
+
+    RenderZoom::SetLastPatchScanForTest(0); // force a scan on the next frame
+    CHECK(RenderZoom::PreRender() == false);
+    CHECK(RenderZoom::IsEnabled() == false);
+    CHECK(game.viewBounds[2] == 640); // unsubstituted by Disable
+    RenderZoom::SetEnabled(false);
+}
+
+TEST_CASE("RenderZoom: CompositeSurface rejects a non-game slot") {
+    TestableZoomer::ResetState();
+    RenderZoom::SetEnabled(true);
+
+    FakeGameRegion game;
+    REQUIRE(game.Create(800, 600));
+    game.FillPattern();
+    Zoomer::SetViewRect({ 0, 0, 640, 400 }, true);
+    Zoomer::g_zoom.store(2.0f);
+    Zoomer::g_targetZoom.store(2.0f);
+    REQUIRE(RenderZoom::PreRender() == true);
+
+    // Point the composite slot outside the fake game module: LockView's
+    // CompositeSurface probe rejects it and PostRender leaves the frame alone.
+    static void* outsider = nullptr;
+    RenderZoom::SetTestGameRegion(game.base, &outsider,
+        game.viewBounds, game.windowBounds);
+    RenderZoom::PostRender();
+    CHECK(game.surface->locks == 0);
+
+    // Restore for the destructor.
+    RenderZoom::SetTestGameRegion(game.base, game.compositeSlot,
+        game.viewBounds, game.windowBounds);
+    RenderZoom::PostRender();
+    RenderZoom::SetEnabled(false);
 }
 

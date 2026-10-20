@@ -35,6 +35,11 @@ namespace
 	// real game entry point (which does not exist outside gamemd.exe).
 	SetCameraPositionFn g_setCameraPosition = reinterpret_cast<SetCameraPositionFn>(SET_CAMERA_POSITION);
 
+	// Redirectable Enable() probe address: defaults to the real entry point;
+	// tests point it at a buffer they own (inside a loaded module) so the
+	// prologue check can run outside gamemd.exe.
+	const void* g_cameraProbeAddress = reinterpret_cast<const void*>(SET_CAMERA_POSITION);
+
 	// Test double for TacticalClass::Instance: the real reference is bound to
 	// a fixed game address whose page can collide with DLL images (ASLR) in
 	// the test process, so tests supply the instance explicitly. Null is the
@@ -60,24 +65,32 @@ void GameCamera::Enable()
 {
 	if (g_enabled) return;
 
+#ifdef VIEWCTRL_TEST
+	const uintptr_t probe = reinterpret_cast<uintptr_t>(g_cameraProbeAddress);
+#else
+	const uintptr_t probe = SET_CAMERA_POSITION;
+#endif
+
 	HMODULE module = nullptr;
 	if (!GetModuleHandleExA(
 		GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-		reinterpret_cast<LPCSTR>(SET_CAMERA_POSITION), &module) || module == nullptr)
+		reinterpret_cast<LPCSTR>(probe), &module) || module == nullptr)
 	{
-		LOG("GameCamera: address 0x%IX is not inside a loaded module, disabled", SET_CAMERA_POSITION);
+		LOG("GameCamera: address 0x%IX is not inside a loaded module, disabled", probe);
 		return;
 	}
 
-	if (*reinterpret_cast<const BYTE*>(SET_CAMERA_POSITION) != SET_CAMERA_POSITION_PROLOGUE)
+	if (*reinterpret_cast<const BYTE*>(probe) != SET_CAMERA_POSITION_PROLOGUE)
 	{
-		LOG("GameCamera: unexpected prologue at 0x%IX, disabled", SET_CAMERA_POSITION);
+		LOG("GameCamera: unexpected prologue at 0x%IX, disabled", probe);
 		return;
 	}
 
 	g_enabled = true;
-	LOG("GameCamera: enabled (SetCameraPosition=%p module=%p instance=%p)",
-		reinterpret_cast<void*>(SET_CAMERA_POSITION), module, TacticalClass::Instance);
+	// Note: do not dereference TacticalClass::Instance here — the fixed game
+	// slot can be an unmapped page outside gamemd.exe (unit tests).
+	LOG("GameCamera: enabled (SetCameraPosition=%p module=%p)",
+		reinterpret_cast<void*>(probe), module);
 }
 
 void GameCamera::Disable()
@@ -167,5 +180,12 @@ void GameCamera::SetCameraPositionForTest(void* fn)
 	g_setCameraPosition = fn
 		? reinterpret_cast<SetCameraPositionFn>(fn)
 		: reinterpret_cast<SetCameraPositionFn>(SET_CAMERA_POSITION);
+}
+
+void GameCamera::SetCameraProbeAddressForTest(const void* address)
+{
+	g_cameraProbeAddress = address
+		? address
+		: reinterpret_cast<const void*>(SET_CAMERA_POSITION);
 }
 #endif
