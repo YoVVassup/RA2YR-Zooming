@@ -29,7 +29,9 @@ namespace GameAddr
 	// RectangleStruct {X, Y, W, H} - the rect the game draws its window into.
 	constexpr DWORD DSurface_WindowBounds = 0x886FB0;
 
-	// DSurface* - the surface both render hooks back up and magnify.
+	// DSurface* - the surface the render hooks stretch the magnified view
+	// over (world-space: the game renders the source rect into it, the post
+	// hook scales that up to the full view area).
 	constexpr DWORD DSurface_Composite = 0x88731C;
 
 	// --- functions, ReSource -----------------------------------------------

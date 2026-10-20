@@ -2,20 +2,33 @@
 
 #include <windows.h>
 
-// Frame by frame zoom of the tactical view.
+// Frame by frame zoom of the tactical view, world-space style.
 //
 // Two Syringe hooks inside GScreenClass::Render (0x4F4480, YRpp) drive it:
-//   0x4F44AF (pre)  - put the original pixels back so the game draws on the
-//                     clean frame, then advance the zoom lerp / game camera.
-//   0x4F451B (post) - back the freshly rendered view rect up and magnify it
-//                     in place inside DSurface::Composite.
+//   0x4F44AF (pre)  - substitute DSurface::ViewBounds.W/H with the source
+//                     rect, so the game itself renders only the magnified
+//                     window (fewer cells, each still 60x30 native pixels),
+//                     and advance the zoom lerp / game camera.
+//   0x4F451B (post) - stretch that freshly rendered corner region over the
+//                     full view area inside DSurface::Composite, then put
+//                     the vanilla view dimensions back.
+//
+// The engine owning the zoomed render is what Kaleidoscope does: overlays,
+// smudge and selection markers drawn inside the view come out consistent by
+// construction, the backup buffer shrinks to the source rect, and the game
+// skips the cells outside it. The final nearest-neighbour stretch is
+// unavoidable - gamemd has no scaled cell blitter - but it runs over a
+// frame the engine already rendered small.
 //
 // The view rect comes from DSurface::ViewBounds, polled at most every 250 ms
-// and only while the zoom factor is back at 1.0.
+// and only while the zoom factor is back at 1.0. While the dimensions are
+// substituted the ScalerConflict L4 watch is fed the vanilla pair only, so
+// the plugin never trips over its own scaling.
 class RenderZoom
 {
 public:
-	// Source rectangle of the backup that gets scaled up to fill the view.
+	// Source rectangle of the rendered view: the sub rect of the full view
+	// that is displayed, magnified, at the anchor point.
 	struct SourceRect
 	{
 		int X = 0;
@@ -33,12 +46,17 @@ public:
 	// (unit tests, a different host exe) they are rejected.
 	static bool IsGameReadable(const void* address, size_t bytes);
 
-	// Runs before the game draws. Returns true when the frame the game is
-	// about to draw on still holds magnified pixels and it has to be told to
-	// repaint everything (emulated by writing 2 into the hooked EAX).
+	// Runs before the game draws. Substitutes the view dimensions with the
+	// source rect while the zoom is active and returns true when the frame
+	// has to be repainted entirely (emulated by writing 2 into the hooked
+	// EAX). Also feeds the ScalerConflict L4 watch and disables the module
+	// when a foreign world-space scaler is detected.
 	static bool PreRender();
 
-	// Runs after the game drew. Backs the view rect up and magnifies it.
+	// Runs after the game drew. Stretches the source rect the engine
+	// rendered over the full view area, then restores the vanilla view
+	// dimensions so the coordinate paths between frames see the original
+	// pair again.
 	static void PostRender();
 
 	// --- pure helpers, also covered by the unit tests ---
@@ -46,12 +64,14 @@ public:
 	static SourceRect ComputeSourceRect(
 		int viewW, int viewH, int anchorX, int anchorY, float zoom);
 
+	// Nearest-neighbour stretch of the src sub rect over the dstW x dstH
+	// destination (the scratch buffer feeds it the rendered source rect).
 	static void Upscale(
 		const unsigned short* backup, int backupW,
 		unsigned short* dst, int dstPitch,
 		int dstW, int dstH, const SourceRect& src);
 
-	// Copies the view rect between the surface and the backup buffer.
+	// Copies a view rect between the surface and the scratch buffer.
 	static bool CopyRows(
 		unsigned char* pixels, int pitch, const RECT& view,
 		unsigned char* buffer, int bufferW, int bufferH, bool toBuffer);
@@ -92,5 +112,9 @@ public:
 	// Address the WindowBounds reads go through: the game global by default,
 	// the test region after SetTestGameRegion (Zoomer::DefaultViewRect).
 	static const void* TestWindowBoundsAddress();
+
+	// Pins the L3 patch-scan timestamp so the next PreRender always scans
+	// (or forces the scan to look stale).
+	static void SetLastPatchScanForTest(DWORD ms);
 #endif
 };

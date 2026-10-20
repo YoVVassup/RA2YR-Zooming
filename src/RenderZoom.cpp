@@ -1,5 +1,6 @@
 #include "RenderZoom.hpp"
 #include "Zoomer.hpp"
+#include "ScalerConflict.hpp"
 #include "GameAddrs.hpp"
 #include "Log.h"
 
@@ -20,6 +21,10 @@ namespace
 	// at most four times a second.
 	constexpr DWORD VIEW_RECT_POLL_MS = 250;
 
+	// How often the eight scaler-fingerprint hook sites are re-checked for a
+	// foreign runtime patch (MOExperience re-patches when ScaleBar toggles).
+	constexpr DWORD PATCH_SCAN_MS = 1000;
+
 	constexpr float ZOOM_EPSILON = 1.001f;
 
 	using SurfaceIntFn = int(__thiscall*)(void*);
@@ -28,11 +33,23 @@ namespace
 
 	bool g_enabled = false;
 
-	bool g_haveBackup = false;
-	RECT g_backupRect = {};
+	// Scratch buffer for the stretch: it holds the source rect the engine
+	// rendered, so it never grows past the full view and shrinks with the
+	// zoom factor in practice.
 	std::vector<unsigned char> g_buffer;
-	int g_bufferW = 0;
-	int g_bufferH = 0;
+
+	// True while DSurface::ViewBounds.W/H hold the substituted source rect
+	// sizes, i.e. between a successful PreRender and the PostRender that
+	// restores them. The vanilla pair is saved next to it.
+	bool g_substituted = false;
+	int g_savedViewW = 0;
+	int g_savedViewH = 0;
+
+	// True when the previous frame was magnified: its stretch is still on
+	// screen, so the first vanilla frame repaints everything.
+	bool g_magnifiedLastFrame = false;
+
+	DWORD g_lastPatchScanMs = 0;
 
 	RECT g_viewRect = {};
 	bool g_viewRectValid = false;
@@ -76,7 +93,7 @@ namespace
 		return vtable;
 	}
 
-	bool ReadGameViewRect(RECT& out)
+	bool ReadGameViewRect(RECT& out, int* windowW, int* windowH)
 	{
 		if (!RenderZoom::IsGameReadable(g_viewBounds, 4 * sizeof(int))) return false;
 		if (!RenderZoom::IsGameReadable(g_windowBounds, 4 * sizeof(int))) return false;
@@ -90,6 +107,9 @@ namespace
 		memcpy(view, g_viewBounds, sizeof(view));
 		memcpy(window, g_windowBounds, sizeof(window));
 
+		if (windowW) *windowW = window[2];
+		if (windowH) *windowH = window[3];
+
 		// Only a view rect that is smaller than the window rect describes the
 		// tactical view — the sidebar is what makes it smaller. Otherwise the
 		// surface has no separate view area and nothing is magnified.
@@ -100,6 +120,33 @@ namespace
 		out.right = view[0] + view[2];
 		out.bottom = view[1] + view[3];
 		return out.left < out.right && out.top < out.bottom;
+	}
+
+	// The substituted slots: DSurface::ViewBounds.W / .H at +8 / +12.
+	bool ReadViewDims(int& w, int& h)
+	{
+		if (!RenderZoom::IsGameReadable(g_viewBounds, 4 * sizeof(int))) return false;
+		const int* p = reinterpret_cast<const int*>(g_viewBounds);
+		w = p[2];
+		h = p[3];
+		return true;
+	}
+
+	bool WriteViewDims(int w, int h)
+	{
+		if (!RenderZoom::IsGameReadable(g_viewBounds, 4 * sizeof(int))) return false;
+
+		// IsGameReadable only rejects guard / no-access pages; a read-only
+		// view of the game region would pass it and fault on the store.
+		MEMORY_BASIC_INFORMATION mbi = {};
+		if (VirtualQuery(g_viewBounds, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+		const DWORD prot = mbi.Protect & 0xFF;
+		if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE) return false;
+
+		int* p = reinterpret_cast<int*>(const_cast<void*>(g_viewBounds));
+		p[2] = w;
+		p[3] = h;
+		return true;
 	}
 
 	bool LockView(const RECT& view, void*& pixels, int& pitch)
@@ -115,7 +162,7 @@ namespace
 		const auto lock = reinterpret_cast<SurfaceLockFn>(vtable[VT_LOCK]);
 		if (!getBytesPerPixel || !getPitch || !getWidth || !getHeight || !lock) return false;
 
-		// Only 16 bit surfaces are backed up and magnified here.
+		// Only 16 bit surfaces are stretched here.
 		if (getBytesPerPixel(surface) != 2) return false;
 		if (view.left < 0 || view.top < 0) return false;
 		if (view.right > getWidth(surface) || view.bottom > getHeight(surface)) return false;
@@ -137,33 +184,16 @@ namespace
 		if (unlock) unlock(surface);
 	}
 
-	bool RestoreBackup()
+	// Puts the vanilla view dimensions back. Only meaningful while a
+	// substitution is active; silently succeeds when the globals are gone.
+	void RestoreViewDims()
 	{
-		if (!g_haveBackup || g_buffer.empty()) return false;
-
-		const int w = g_backupRect.right - g_backupRect.left;
-		const int h = g_backupRect.bottom - g_backupRect.top;
-		if (w <= 0 || h <= 0 || w > g_bufferW || h > g_bufferH) return false;
-
-		void* pixels = nullptr;
-		int pitch = 0;
-		if (!LockView(g_backupRect, pixels, pitch)) return false;
-
-		const bool ok = RenderZoom::CopyRows(
-			static_cast<unsigned char*>(pixels), pitch, g_backupRect,
-			g_buffer.data(), g_bufferW, g_bufferH, false);
-		UnlockSurface();
-		return ok;
+		if (WriteViewDims(g_savedViewW, g_savedViewH))
+			g_substituted = false;
 	}
 
 	// Everything the replaced "mov ebx, [0x886FA8]" / "[0x886FAC]" would have
 	// loaded, swapped for the visible source rect while the view is magnified.
-	//
-	// If the global cannot be read the last value seen is returned, not 0:
-	// feeding 0 into ClampCoordMap would pin the camera at the map origin,
-	// while a vanilla-sized dimension keeps the clamp behaving like the
-	// unhooked game. Seed: the view size the game itself writes at init
-	// (mov [0x886FA8], 0x280 / mov [0x886FAC], 0x190 -> 640x400).
 	int ClampViewDimension(bool width)
 	{
 		static int lastWidth = 640;
@@ -192,6 +222,18 @@ namespace
 		const RenderZoom::SourceRect src = RenderZoom::ComputeSourceRect(
 			viewW, viewH, anchor.x - view.left, anchor.y - view.top, zoom);
 		return RenderZoom::ClampDimension(gameDim, width ? src.W : src.H, true);
+	}
+
+	// Shuts the plugin down from inside the game: unsubstitutes the view
+	// dimensions, disarms the hooks and drops the window subclass.
+	void Disable(const char* reason)
+	{
+		LOG("RenderZoom: disabled (%s)", reason);
+		if (g_substituted)
+			RestoreViewDims();
+		g_enabled = false;
+		Zoomer::Shutdown();
+		RenderZoom::ResetFrameState();
 	}
 }
 
@@ -262,15 +304,21 @@ const void* RenderZoom::TestWindowBoundsAddress()
 {
 	return g_windowBounds;
 }
+
+void RenderZoom::SetLastPatchScanForTest(DWORD ms)
+{
+	g_lastPatchScanMs = ms;
+}
 #endif
 
 void RenderZoom::ResetFrameState()
 {
-	g_haveBackup = false;
-	g_backupRect = {};
 	g_buffer.clear();
-	g_bufferW = 0;
-	g_bufferH = 0;
+	g_substituted = false;
+	g_savedViewW = 0;
+	g_savedViewH = 0;
+	g_magnifiedLastFrame = false;
+	g_lastPatchScanMs = 0;
 	g_viewRect = {};
 	g_viewRectValid = false;
 	g_lastViewPoll = 0;
@@ -280,33 +328,115 @@ bool RenderZoom::PreRender()
 {
 	if (!g_enabled) return false;
 
-	// Advance the zoom lerp and the game camera before the frame is drawn, so
-	// the magnification below matches the camera move of this very frame.
+	// Advance the zoom lerp and the game camera before the frame is drawn,
+	// so the substituted view below matches the camera move of this very
+	// frame.
 	Zoomer::TickFrame();
 
-	bool forceRedraw = false;
-	if (g_haveBackup)
-	{
-		// Put the original pixels back first: whatever happens afterwards, the
-		// game draws on a clean frame again.
-		forceRedraw = !RestoreBackup();
-		g_haveBackup = false;
-		if (forceRedraw) LOG("RenderZoom: restore failed, asking for a full repaint");
-	}
+	const DWORD now = GetTickCount();
 
-	// The view rect may only change while nothing is magnified, otherwise the
-	// backup and the pixels on screen would disagree about where they came from.
-	if (Zoomer::CurrentZoom() <= ZOOM_EPSILON)
+	// L3: a foreign module that patched one of our render sites after
+	// Syringe installed our hooks (MOExperience re-patches at runtime).
+	if (now - g_lastPatchScanMs >= PATCH_SCAN_MS)
 	{
-		RECT candidate = {};
-		if (ReadGameViewRect(candidate) && AcceptViewRect(candidate, GetTickCount()))
+		g_lastPatchScanMs = now;
+		if (ScalerConflict::RuntimePatchPresent())
 		{
-			LOG("RenderZoom: view rect (%ld,%ld)-(%ld,%ld)",
-				candidate.left, candidate.top, candidate.right, candidate.bottom);
-			Zoomer::SetViewRect(candidate, true);
+			Disable("a foreign module patched a hook site at runtime");
+			return false;
 		}
 	}
 
+	const float zoom = Zoomer::CurrentZoom();
+	const bool magnified = zoom > ZOOM_EPSILON;
+
+	bool forceRedraw = false;
+
+	// Defensive: PostRender unsubstitutes at the end of every magnified
+	// frame; clean up the rare frame where that did not happen.
+	if (!magnified && g_substituted)
+	{
+		RestoreViewDims();
+		forceRedraw = true;
+	}
+
+	if (magnified)
+	{
+		const RECT view = Zoomer::ViewRect();
+		const int w = view.right - view.left;
+		const int h = view.bottom - view.top;
+		if (w > 0 && h > 0)
+		{
+			const POINT anchor = Zoomer::ZoomAnchor();
+			const SourceRect src = ComputeSourceRect(
+				w, h, anchor.x - view.left, anchor.y - view.top, zoom);
+
+			// Substitute only for a real magnification; a degenerate source
+			// rect falls back to the whole view and renders vanilla.
+			if (src.W > 0 && src.H > 0 && src.W < w && src.H < h)
+			{
+				if (!g_substituted)
+				{
+					int savedW = 0;
+					int savedH = 0;
+					if (!ReadViewDims(savedW, savedH))
+					{
+						// No game data to substitute; render vanilla.
+						if (g_magnifiedLastFrame) forceRedraw = true;
+						g_magnifiedLastFrame = false;
+						return forceRedraw;
+					}
+					g_savedViewW = savedW;
+					g_savedViewH = savedH;
+					if (!WriteViewDims(src.W, src.H))
+					{
+						if (g_magnifiedLastFrame) forceRedraw = true;
+						g_magnifiedLastFrame = false;
+						return forceRedraw;
+					}
+					g_substituted = true;
+					LOG("RenderZoom: view %dx%d -> source %dx%d",
+						savedW, savedH, src.W, src.H);
+				}
+				// The engine renders the small view; ask it to repaint all
+				// of it so no stale full view pixels leak in.
+				forceRedraw = true;
+			}
+		}
+	}
+	else
+	{
+		// Poll the vanilla view rect and feed the reactive watch. Only runs
+		// while nothing is substituted, so the watch never sees our own
+		// scaling.
+		RECT candidate = {};
+		int windowW = 0;
+		int windowH = 0;
+		if (ReadGameViewRect(candidate, &windowW, &windowH))
+		{
+			ScalerConflict::ObserveViewDims(windowW, windowH,
+				candidate.right - candidate.left, candidate.bottom - candidate.top,
+				now);
+			if (ScalerConflict::ReactiveConflict())
+			{
+				Disable("a world-space scaler is rescaling the view");
+				return false;
+			}
+
+			if (AcceptViewRect(candidate, now))
+			{
+				LOG("RenderZoom: view rect (%ld,%ld)-(%ld,%ld)",
+					candidate.left, candidate.top, candidate.right, candidate.bottom);
+				Zoomer::SetViewRect(candidate, true);
+			}
+		}
+
+		// The stretch of the previous magnified frames is still on screen:
+		// one full vanilla repaint clears it.
+		if (g_magnifiedLastFrame) forceRedraw = true;
+	}
+
+	g_magnifiedLastFrame = magnified && g_substituted;
 	return forceRedraw;
 }
 
@@ -315,44 +445,52 @@ void RenderZoom::PostRender()
 	if (!g_enabled) return;
 
 	const float zoom = Zoomer::CurrentZoom();
-	if (zoom <= ZOOM_EPSILON) return;
+	const bool magnified = zoom > ZOOM_EPSILON;
 
-	const RECT view = Zoomer::ViewRect();
-	const int w = view.right - view.left;
-	const int h = view.bottom - view.top;
-	if (w <= 0 || h <= 0) return;
-
-	void* pixels = nullptr;
-	int pitch = 0;
-	if (!LockView(view, pixels, pitch)) return;
-
-	const size_t bytes = (size_t)w * h * 2;
-	if (g_buffer.size() < bytes) g_buffer.resize(bytes);
-
-	if (!CopyRows(static_cast<unsigned char*>(pixels), pitch, view,
-		g_buffer.data(), w, h, true))
+	if (magnified && g_substituted)
 	{
-		UnlockSurface();
-		return;
+		const RECT view = Zoomer::ViewRect();
+		const int fullW = view.right - view.left;
+		const int fullH = view.bottom - view.top;
+
+		const POINT anchor = Zoomer::ZoomAnchor();
+		const SourceRect src = ComputeSourceRect(
+			fullW, fullH, anchor.x - view.left, anchor.y - view.top, zoom);
+
+		if (fullW > 0 && fullH > 0 && src.W > 0 && src.H > 0
+			&& src.W < fullW && src.H < fullH)
+		{
+			// The engine rendered only the source rect, at the view origin.
+			const RECT drawn = {
+				view.left, view.top, view.left + src.W, view.top + src.H
+			};
+
+			void* pixels = nullptr;
+			int pitch = 0;
+			if (LockView(view, pixels, pitch))
+			{
+				const size_t bytes = (size_t)src.W * src.H * 2;
+				if (g_buffer.size() < bytes) g_buffer.resize(bytes);
+
+				if (CopyRows(static_cast<unsigned char*>(pixels), pitch, drawn,
+					g_buffer.data(), src.W, src.H, true))
+				{
+					auto* dst = reinterpret_cast<unsigned short*>(
+						static_cast<unsigned char*>(pixels)
+						+ (size_t)view.top * pitch + (size_t)view.left * 2);
+					Upscale(reinterpret_cast<const unsigned short*>(g_buffer.data()), src.W,
+						dst, pitch / 2, fullW, fullH,
+						SourceRect{ 0, 0, src.W, src.H });
+				}
+				UnlockSurface();
+			}
+		}
 	}
 
-	g_backupRect = view;
-	g_bufferW = w;
-	g_bufferH = h;
-	g_haveBackup = true;
-
-	// Magnify the backup in place. The anchor is the point the whole zoom keeps
-	// fixed, which is the center of the view rect as long as nothing panned it.
-	const POINT anchor = Zoomer::ZoomAnchor();
-	const SourceRect src = ComputeSourceRect(
-		w, h, anchor.x - view.left, anchor.y - view.top, zoom);
-
-	auto* dst = reinterpret_cast<unsigned short*>(
-		static_cast<unsigned char*>(pixels) + (size_t)view.top * pitch + (size_t)view.left * 2);
-	Upscale(reinterpret_cast<const unsigned short*>(g_buffer.data()), w,
-		dst, pitch / 2, w, h, src);
-
-	UnlockSurface();
+	// The stretch ran (or was skipped): between frames the coordinate paths
+	// must see the vanilla view dimensions again.
+	if (g_substituted)
+		RestoreViewDims();
 }
 
 RenderZoom::SourceRect RenderZoom::ComputeSourceRect(
