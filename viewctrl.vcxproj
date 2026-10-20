@@ -121,6 +121,7 @@
     <ClInclude Include="src\GameCamera.hpp" />
     <ClInclude Include="src\RenderZoom.hpp" />
     <ClInclude Include="src\Log.h" />
+    <ClInclude Include="src\Seh.h" />
     <ClInclude Include="YRpp\Helpers\Cast.h" />
     <ClInclude Include="YRpp\Helpers\CompileTime.h" />
     <ClInclude Include="YRpp\Helpers\Enumerators.h" />

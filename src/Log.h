@@ -31,8 +31,51 @@ namespace Debug
         return path;
     }
 
+    // Release builds log only when the player opts in: set the VIEWCTRL_LOG
+    // environment variable to a non-empty value other than "0" and a
+    // ViewCtrl.log appears next to the game executable — no Debug rebuild
+    // needed for a support request. Debug builds always log.
+    // Cached after the first call so the per-frame hooks pay a load only.
+#ifdef VIEWCTRL_TEST
+    // Tests pin the flag so the disabled branch of Log() can run under
+    // the Debug configuration (where the env-var path is compiled out).
+    inline bool& LogForceDisabled()
+    {
+        static bool flag = false;
+        return flag;
+    }
+#endif
+
+    inline bool LogEnabled()
+    {
+#ifdef VIEWCTRL_TEST
+        if (LogForceDisabled())
+            return false;
+#endif
+#ifdef NDEBUG
+        static const bool enabled = []() {
+            char buf[8] = {};
+            const DWORD n = GetEnvironmentVariableA("VIEWCTRL_LOG", buf, sizeof(buf));
+            return n > 0 && n < sizeof(buf) && buf[0] != '0';
+        }();
+        return enabled;
+#else
+        return true;
+#endif
+    }
+
+#ifdef VIEWCTRL_TEST
+    inline void SetLogEnabledForTest(bool enabled)
+    {
+        LogForceDisabled() = !enabled;
+    }
+#endif
+
     inline void Log(const char* fmt, ...)
     {
+        if (!LogEnabled())
+            return;
+
         char buf[1024];
         va_list args;
         va_start(args, fmt);
@@ -53,10 +96,11 @@ namespace Debug
     }
 }
 
-// Release builds compile logging out entirely: no ViewCtrl.log is ever
-// created next to the game. Debug builds keep the file for troubleshooting.
+// Debug builds always write ViewCtrl.log next to the game executable.
+// Release builds write nothing unless VIEWCTRL_LOG is set (see
+// Debug::LogEnabled); the call still costs one cached bool check.
 #ifdef NDEBUG
-#define LOG(fmt, ...) ((void)0)
+#define LOG(fmt, ...) do { if (Debug::LogEnabled()) Debug::Log("[ViewCtrl] " fmt "\n", ##__VA_ARGS__); } while (0)
 #else
 #define LOG(fmt, ...) Debug::Log("[ViewCtrl] " fmt "\n", ##__VA_ARGS__)
 #endif

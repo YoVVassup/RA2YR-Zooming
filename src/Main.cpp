@@ -3,10 +3,12 @@
 #include "RenderZoom.hpp"
 #include "ScalerConflict.hpp"
 #include "Log.h"
+#include "Seh.h"
 #include <cmath>
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 {
+	(void)lpvReserved;
 	switch (fdwReason) {
 	case DLL_PROCESS_ATTACH:
 		LOG("DLL_PROCESS_ATTACH hModule=%p", hinstDLL);
@@ -28,19 +30,30 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved)
 // returning 0 runs the original bytes, so both handlers compose.
 DEFINE_HOOK(0x52CAE9, GameInt, 0x5)
 {
-	// GScript.ext (the scaler shipped by big mods) and Telescope v1.4 both
-	// scale the view themselves; competing with them would transform the
-	// frame twice. When either is loaded, stay inert: no Zoomer::Init(), so
-	// no init thread, no window subclass and every hook below keeps
-	// replaying the original instructions.
-	if (ScalerConflict::Present())
+	(void)R; // bootstrap hook — no registers are read or written here
+	// Big mods ship their own zoom (GScript.ext, Kaleidoscope, MOExperience,
+	// Telescope, Ra2.Vampire.Zoom); competing with them would transform the
+	// frame twice. ScalerConflict::Present() layers a module-name list, a
+	// .syhks00 hook-table fingerprint, a runtime byte sniff and a known
+	// export probe; when any of them fires, stay inert: no Zoomer::Init(),
+	// so no init thread, no window subclass and every hook below keeps
+	// replaying the original instructions. The reactive layer (a world-space
+	// scaler rescaling the view mid-game) is watched from
+	// RenderZoom::PreRender.
+	bool conflict = true;
+	VIEWCTRL_SEH_BEGIN
+	conflict = ScalerConflict::Present();
+	if (!conflict)
+	{
+		LOG("DEFINE_HOOK(0x52CAE9) triggered — calling Zoomer::Init()");
+		Zoomer::Init();
+	}
+	else
 	{
 		LOG("GameInt: conflicting scaler present — ViewCtrl stays disabled");
-		return 0;
 	}
-
-	LOG("DEFINE_HOOK(0x52CAE9) triggered — calling Zoomer::Init()");
-	Zoomer::Init();
+	VIEWCTRL_SEH_END
+	(void)conflict;
 	return 0;
 }
 
@@ -50,10 +63,16 @@ DEFINE_HOOK(0x52CAE9, GameInt, 0x5)
 // so the replaced bytes are not executed twice; the handler replays both
 // writes (EAX and CL). Neighbouring framework sites — Kratos 0x4F4497,
 // Ares/Kratos/Phobos 0x4F4583, Phobos 0x4F4589 — none overlaps this window.
-// EAX holds a redraw mode where 2 means "repaint everything".
+// EAX holds a redraw mode where 2 means "repaint everything": while the view
+// is magnified RenderZoom::PreRender substitutes DSurface::ViewBounds with
+// the source rect and asks for a full repaint of that smaller view, and the
+// first vanilla frame after a magnified one repaints to clear the stretch.
 DEFINE_HOOK(0x4F44AF, ViewCtrlPreRenderRestore, 0x5)
 {
-	const bool forceRedraw = RenderZoom::PreRender();
+	bool forceRedraw = false;
+	VIEWCTRL_SEH_BEGIN
+	forceRedraw = RenderZoom::PreRender();
+	VIEWCTRL_SEH_END
 
 	const DWORD eax = forceRedraw ? 2u : R->EAX();
 	R->EAX(eax);
@@ -63,7 +82,7 @@ DEFINE_HOOK(0x4F44AF, ViewCtrlPreRenderRestore, 0x5)
 
 // 0x4F451B: "mov al, byte ptr [0xB0B519]" — the 5 bytes right after the frame
 // was drawn into DSurface::Composite, also inside GScreenClass::Render.
-// Frame order proven by disassembly: this magnify runs before
+// Frame order proven by disassembly: this stretch runs before
 // wwmouse->DrawCursorBuffered(Composite) at 0x4F4583 (cursor is blitted
 // unscaled on top), before the virtual RenderFrame() at 0x4F459A (vtable
 // 0x7E1964, slot 0x44 — the table stored into [0x87F7E8] at 0x40D1B2), and
@@ -85,7 +104,9 @@ void SetFlagByteForTest(const BYTE* p)
 
 DEFINE_HOOK(0x4F451B, ViewCtrlPostRenderZoom, 0x5)
 {
+	VIEWCTRL_SEH_BEGIN
 	RenderZoom::PostRender();
+	VIEWCTRL_SEH_END
 
 #ifdef VIEWCTRL_TEST
 	const DWORD eax = (R->EAX() & 0xFFFFFF00u) | (DWORD)(*g_flagByte);
@@ -103,7 +124,11 @@ DEFINE_HOOK(0x4F451B, ViewCtrlPostRenderZoom, 0x5)
 // matching view height read.
 DEFINE_HOOK(0x6D864E, ViewCtrlClampWidth, 0x6)
 {
-	R->EBX((DWORD)RenderZoom::ClampWidth());
+	int width = 0;
+	VIEWCTRL_SEH_BEGIN
+	width = RenderZoom::ClampWidth();
+	VIEWCTRL_SEH_END
+	R->EBX((DWORD)width);
 	return 0x6D8654;
 }
 
@@ -111,7 +136,11 @@ DEFINE_HOOK(0x6D864E, ViewCtrlClampWidth, 0x6)
 // width was already used, so only the height half of the clamp changes here.
 DEFINE_HOOK(0x6D868A, ViewCtrlClampHeight, 0x6)
 {
-	R->EBX((DWORD)RenderZoom::ClampHeight());
+	int height = 0;
+	VIEWCTRL_SEH_BEGIN
+	height = RenderZoom::ClampHeight();
+	VIEWCTRL_SEH_END
+	R->EBX((DWORD)height);
 	return 0x6D8690;
 }
 
@@ -139,6 +168,7 @@ DEFINE_HOOK(0x692325, ViewCtrlProcessClickCoords, 0x6)
 
 	POINT* pt = reinterpret_cast<POINT*>(R->Stack32(0x28));
 	POINT* use = pt;
+	VIEWCTRL_SEH_BEGIN
 	if (pt)
 	{
 		POINT out = {};
@@ -154,6 +184,7 @@ DEFINE_HOOK(0x692325, ViewCtrlProcessClickCoords, 0x6)
 			}
 		}
 	}
+	VIEWCTRL_SEH_END
 
 	R->EBP(reinterpret_cast<DWORD>(use));
 	if (R->EDX())
@@ -171,6 +202,7 @@ DEFINE_HOOK(0x6D9F80, ViewCtrlDragBandStart, 0x6)
 	static bool logged = false;
 
 	POINT* pt = reinterpret_cast<POINT*>(R->Stack32(4));
+	VIEWCTRL_SEH_BEGIN
 	if (pt)
 	{
 		POINT out = {};
@@ -189,6 +221,7 @@ DEFINE_HOOK(0x6D9F80, ViewCtrlDragBandStart, 0x6)
 
 	const DWORD thisPtr = R->ECX();
 	R->EAX(thisPtr ? *reinterpret_cast<const DWORD*>(thisPtr + 0xD90) : 0u);
+	VIEWCTRL_SEH_END
 	return 0x6D9F86;
 }
 
@@ -200,6 +233,7 @@ DEFINE_HOOK(0x6D9FC0, ViewCtrlDragBandEnd, 0x6)
 	static bool logged = false;
 
 	POINT* pt = reinterpret_cast<POINT*>(R->Stack32(4));
+	VIEWCTRL_SEH_BEGIN
 	if (pt)
 	{
 		POINT out = {};
@@ -218,6 +252,7 @@ DEFINE_HOOK(0x6D9FC0, ViewCtrlDragBandEnd, 0x6)
 
 	const DWORD thisPtr = R->ECX();
 	R->EAX(thisPtr ? *reinterpret_cast<const DWORD*>(thisPtr + 0xD90) : 0u);
+	VIEWCTRL_SEH_END
 	return 0x6D9FC6;
 }
 
@@ -230,6 +265,7 @@ DEFINE_HOOK(0x693791, ViewCtrlRightDragSpeed, 0x6)
 {
 	static bool logged = false;
 
+	VIEWCTRL_SEH_BEGIN
 	const DWORD obj = R->EBX();
 	if (obj
 		&& RenderZoom::IsGameReadable(reinterpret_cast<const void*>(obj), 0x5558 + 1)
@@ -253,6 +289,7 @@ DEFINE_HOOK(0x693791, ViewCtrlRightDragSpeed, 0x6)
 			}
 		}
 	}
+	VIEWCTRL_SEH_END
 
 	R->ESI(0u);
 	R->ref_Stack<DWORD>(0x28) = 0u;
