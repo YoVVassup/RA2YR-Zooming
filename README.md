@@ -1,11 +1,13 @@
 # ViewCtrl — Zoom Plugin for C&C: Yuri's Revenge
 
+**English** · [Русский](README.ru-RU.md) · [简体中文](README.zh-CN.md)
+
 [![License: GPL v3](https://img.shields.io/github/license/YoVVassup/RA2YR-Zooming)](LICENSE.txt)
 [![Language](https://img.shields.io/badge/language-C%2B%2B-00599C?logo=cplusplus&logoColor=white)](#technical-implementation)
 [![Platform](https://img.shields.io/badge/platform-Windows%20x86-0078D6?logo=windows&logoColor=white)](#requirements)
 [![Game](https://img.shields.io/badge/game-C%26C%3A%20Yuri%27s%20Revenge-E6A23C)](#requirements)
 [![Framework](https://img.shields.io/badge/framework-Syringe-7B68EE)](#technical-implementation)
-[![Tests](https://img.shields.io/badge/tests-51%20cases%20%7C%20533%20assertions-4CAF50)](#status)
+[![Tests](https://img.shields.io/badge/tests-69%20cases%20%7C%20653%20assertions-4CAF50)](#status)
 [![Fork of](https://img.shields.io/badge/fork%20of-ChoyoTsumu%2FRA2--about-1f6feb?logo=github&logoColor=white)](https://github.com/ChoyoTsumu/RA2-about)
 
 ---
@@ -34,11 +36,12 @@ Built on the **Windows API** with **Syringe** (the injection framework used by A
 
 ## ✅ Status
 
-- 🧪 **Unit tests:** 51 test cases / 533 assertions — `tests\bin\ViewCtrlTests.exe`
-- 📊 **Line coverage:** ~99% of `src/` (measured with OpenCppCoverage over the doctest suite; the remainder is `GameCamera::Enable`'s success path, which needs the real game module, plus a few defensive error branches)
-- ⚠️ **Competing scalers auto-detected:** when the mod scales the view itself — `GScript.ext` (e.g. Tiberium Crisis) or Telescope v1.4 (which bundles these same nine hooks) — `GameInt` notices (module file name, or any other loaded plugin claiming ≥3 of our nine hook sites) and keeps ViewCtrl inert: no init thread, no window subclass, every hook replays the original instructions, so the mod's own scaler runs undisturbed
+- 🧪 **Unit tests:** 69 test cases / 653 assertions — `tests\bin\ViewCtrlTests.exe`
+- 📊 **Line coverage:** 99.7% of `src/` (measured with OpenCppCoverage over the doctest suite; the remainder is a few defensive OS-failure branches)
+- ⚠️ **Competing scalers auto-detected** (see [docs/conflict-detection.md](docs/conflict-detection.md)): when the mod scales the view itself — `GScript.ext` (e.g. Tiberium Crisis), Telescope v1.4, Kaleidoscope, MOExperience or Ra2.Vampire.Zoom — `GameInt` notices and keeps ViewCtrl inert. Detection is layered: **L1** module file name, **L2** `.syhks00` hook-table fingerprint, **L3** runtime byte sniff for foreign `E9` patches, **L4** reactive view-size watch, **L5** scaler-specific export probe — a renamed or runtime-patched competitor is still caught
 - 🔬 **Static audit:** every hook site was verified against the YR Hook Encyclopedia — Syringe-stub safe (no relative branches inside the stolen windows, resume addresses on instruction boundaries), no registry conflicts; the bootstrap hook `0x52CAE9` is shared with Ares (`_YR_PostGameInit`) and composes with it
 - 🖥 **Render order verified by disassembly:** magnification runs after the game draws into `DSurface::Composite`, before the cursor blit and before `Frame::Present` — the magnified pixels are what reaches the screen
+- 🛡 **SEH-guarded hooks:** every hook body is wrapped in `__try/__except` so a fault on malformed game memory is swallowed and the original instruction bytes are replayed instead of crashing the game; guards are compiled out of the test build so tests still catch real bugs
 - 🎮 **Verified in-game** on Yuri's Revenge 1.001 (modded install, 1920x1080): zoom range and anchor, click/selection transforms, reset and undo
 
 ---
@@ -56,7 +59,7 @@ Built on the **Windows API** with **Syringe** (the injection framework used by A
 1. Make sure the game runs through Syringe (`Syringe.exe` or a mod launcher based on it)
 2. Place the compiled DLL in the game root directory
 3. Register the DLL in your Syringe loader configuration
-4. Launch the game — Release builds run silently and write no files; a Debug build creates a `ViewCtrl.log` next to the game executable for troubleshooting
+4. Launch the game — Release builds run silently and write no files by default; to get a diagnostic log without rebuilding, set the environment variable `VIEWCTRL_LOG=1` before launching (the log goes to the debugger output / DebugView). A Debug build always writes `ViewCtrl.log` next to the game executable
 
 ---
 
@@ -105,8 +108,9 @@ Without Ctrl the wheel is passed to the game untouched. All zoom parameters are 
 
 - Hooks only, never rewrites the executable — co-loadable with other Syringe DLLs (Ares, Phobos, ...); Syringe chains multiple DLLs at shared sites
 - `0x52CAE9` shares its 5 bytes with Ares `_YR_PostGameInit`; ViewCtrl runs the original bytes afterwards, so both handlers compose
-- Earlier builds could delegate the zoom factor to GScript; ViewCtrl no longer reads or writes GScript — if GScript's own zoom feature is active, disable one of the two to avoid double zooming
-- If you encounter compatibility issues with a specific mod, please open an Issue with details and the `ViewCtrl.log` from a Debug build (Release builds compile logging out entirely)
+- Earlier builds could delegate the zoom factor to GScript; ViewCtrl no longer reads or writes GScript — if GScript's own zoom feature is active, one of the two is auto-disabled (see [docs/conflict-detection.md](docs/conflict-detection.md))
+- Display-layer scalers (cnc-ddraw forks, Vampire.Zoom) change the window size, not the view rect — they co-load, but the combined magnification is usually not what you want
+- If you encounter compatibility issues with a specific mod, please open an Issue with details and the `ViewCtrl.log` from a Debug build (Release builds compile file logging out entirely; enable transient logging with `VIEWCTRL_LOG=1`)
 
 ---
 
@@ -129,6 +133,14 @@ Without Ctrl the wheel is passed to the game untouched. All zoom parameters are 
 - **Camera:** every zoom step moves the game camera (`TacticalMapClass::SetCameraPosition`, `0x6D6000`) so the focused point stays under the cursor; the offset is undone at 1.0x
 - **View rect:** `DSurface::ViewBounds`, polled at most every 250 ms and accepted only while nothing is magnified; the rect itself excludes the sidebar
 - **Coordinate transforms:** the points where the game turns screen positions into game space are un-magnified; `Zoomer::UnMagnify` is the exact inverse of the upscale the renderer draws
+- **Robustness:** every hook body is wrapped in SEH (`src\Seh.h`) so a fault is swallowed and the original bytes are replayed; Release logging is off by default and can be toggled at runtime with `VIEWCTRL_LOG=1`
+
+---
+
+## 📚 Documentation
+
+- [docs/conflict-detection.md](docs/conflict-detection.md) — how competing scalers are detected (L1–L5) and what is *not* a conflict
+- [docs/research-landscape.md](docs/research-landscape.md) — survey of every known YR zoom implementation and how ViewCtrl relates to each
 
 ---
 
