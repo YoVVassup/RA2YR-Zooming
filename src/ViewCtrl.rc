@@ -2,7 +2,7 @@
 
 #define VIEWCTRL_VERSION_MAJOR 1
 #define VIEWCTRL_VERSION_MINOR 1
-#define VIEWCTRL_VERSION_PATCH 0
+#define VIEWCTRL_VERSION_PATCH 1
 #define VIEWCTRL_VERSION_BUILD 0
 
 VS_VERSION_INFO VERSIONINFO
@@ -24,12 +24,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "ViewCtrl"
             VALUE "FileDescription", "Viewport Zoom Plugin for C&C: Yuri's Revenge"
-            VALUE "FileVersion", "1.1.0.0"
+            VALUE "FileVersion", "1.1.1.0"
             VALUE "InternalName", "ViewCtrl"
             VALUE "LegalCopyright", "GPLv3"
             VALUE "OriginalFilename", "ViewCtrl.dll"
             VALUE "ProductName", "ViewCtrl"
-            VALUE "ProductVersion", "1.1.0.0"
+            VALUE "ProductVersion", "1.1.1.0"
         END
     END
     BLOCK "VarFileInfo"
