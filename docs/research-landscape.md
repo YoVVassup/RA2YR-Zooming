@@ -13,12 +13,12 @@ PE/COFF disassembly, `.syhks00` hook tables, export tables, and the
 
 ## Summary table
 
-| Implementation | Technique | Zoom range | Hook sites claimed (of ViewCtrl's 9) | Detect layer |
+| Implementation | Technique | Zoom range | Hook sites claimed (of ViewCtrl's 17) | Detect layer |
 |---|---|---|---|---|
-| **ViewCtrl** (this repo) | World-space: substitute `ViewBounds` with a source rect, nearest-neighbour stretch after the game draws | 1.0–4.0, gear 1.15 | all 9 (own) | — |
-| **Telescope v1.4** | Fork of an earlier ViewCtrl: same nine sites, same un-magnify transforms | 1.0–4.0 | **all 9** | L1 name, L2 table |
-| **Kaleidoscope v1.1** | World-space rescale, independent reimplementation | 0.5–2.0 | **6 of 9** | L1 name, L2 table |
-| **GScript.ext** (Tiberium Crisis 2) | Render-scale factor applied inside `GScreenClass::DrawOnTop`, exposed to its script engine | 1.0–2.0, step 0.2 | none of 9 (hooks sidebar wheel at `0x5371B0`/`0x537240`) | L1 name, L4 reactive, L5 export |
+| **ViewCtrl** (this repo) | World-space: substitute `ViewBounds` with a source rect, nearest-neighbour stretch after the game draws | 1.0–4.0, gear 1.15 | all 17 (own) | — |
+| **Telescope v1.4** | Fork of an earlier ViewCtrl: same nine sites, same un-magnify transforms | 1.0–4.0 | **9 of 17** | L1 name, L2 table |
+| **Kaleidoscope v1.1** | World-space rescale, independent reimplementation | 0.5–2.0 | **6 of 17** | L1 name, L2 table |
+| **GScript.ext** (Tiberium Crisis 2) | Render-scale factor applied inside `GScreenClass::DrawOnTop`, exposed to its script engine | 1.0–2.0, step 0.2 | none of 17 (hooks sidebar wheel at `0x5371B0`/`0x537240`) | L1 name, L4 reactive, L5 export |
 | **MOExperience** (Mental Omega) | Hybrid: a `ScaleBar` UI (9 steps, 0.25×–MAX) plus a runtime `E9` patch of `0x4F451B` | 0.25×–configured max | **re-patches `0x4F451B` at runtime** | L1 name, L3 byte sniff |
 | **Ra2.Vampire.Zoom** | Video-mode switch through a forked cnc-ddraw (`DDEnableZoom`, Mr. Stalina's) | experimental | none (display layer) | L1 name |
 
@@ -42,8 +42,8 @@ the two handlers and the frame would be transformed twice. Caught by L1
 
 ### Kaleidoscope v1.1
 
-Independent world-space implementation, range 0.5×–2.0×. Claims six of the
-nine fingerprint sites in its own `.syhks00`. Same double-transform hazard
+Independent world-space implementation, range 0.5×–2.0×. Claims six
+fingerprint sites in its own `.syhks00`. Same double-transform hazard
 as Telescope. Caught by L1 and L2.
 
 ### GScript.ext
@@ -59,7 +59,7 @@ total conversion (Axion Gear). ~800 hooks, 740 exports. Zoom is one option:
 - Sources: `github.com/freez/GScript` (from the PDB path) — repository is
   deleted or private; no mirrors found.
 
-None of ViewCtrl's nine sites is claimed, so L2 never fires. A renamed
+None of ViewCtrl's seventeen sites is claimed, so L2 never fires. A renamed
 GScript build is still caught by L4 (the view size moves while the window
 holds still) and L5 (the zoom export).
 
@@ -69,7 +69,7 @@ The only known *runtime* patcher of ViewCtrl's sites. From its `DllMain` —
 and again whenever the in-game ScaleBar is toggled — it writes an `E9`
 rel32 jump over `0x4F451B` (post-render), redirecting to its own trampoline.
 Syringe-installed hooks are overwritten in place. ViewCtrl's L3 byte sniff
-re-scans the eight fingerprint sites once a second while magnified and once
+re-scans the sixteen fingerprint sites once a second while magnified and once
 at `GameInt`; a foreign JMP target disables the module immediately.
 
 The ScaleBar itself is a 9-step discrete scale control (0.25× up to a

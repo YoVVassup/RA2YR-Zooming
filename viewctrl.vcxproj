@@ -117,6 +117,7 @@
   <ItemGroup>
     <ClInclude Include="src\Main.hpp" />
     <ClInclude Include="src\ScalerConflict.hpp" />
+    <ClInclude Include="src\TextDefer.hpp" />
     <ClInclude Include="src\Zoomer.hpp" />
     <ClInclude Include="src\GameCamera.hpp" />
     <ClInclude Include="src\RenderZoom.hpp" />
@@ -136,6 +137,7 @@
   <ItemGroup>
     <ClCompile Include="src\Main.cpp" />
     <ClCompile Include="src\ScalerConflict.cpp" />
+    <ClCompile Include="src\TextDefer.cpp" />
     <ClCompile Include="src\Zoomer.cpp" />
     <ClCompile Include="src\GameCamera.cpp" />
     <ClCompile Include="src\RenderZoom.cpp" />

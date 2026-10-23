@@ -227,15 +227,32 @@ void Zoomer::CommitZoom(float newZoom)
 	if (newZoom == oldZoom) return;
 
 	g_cameraBusy = true;
+
+	// Crossing back to the native zoom: pay the accumulated compensation
+	// back FIRST, while the bound is still the relaxed source-rect one.
+	// With the native zoom stored first, ClampCoordMap clamps the payback
+	// against the full view: near the map edge the undo is rejected or
+	// only partially honored, and a focus step run before the undo would
+	// make the camera pay the same movement twice (reclamp, then undo).
+	if (newZoom <= ZOOM_MIN && oldZoom > ZOOM_MIN)
+	{
+		UndoCameraOffset();
+		g_zoom.store(newZoom);
+		g_invZoom.store(1.0f / newZoom);
+		// No focus step at the native zoom: all compensation is gone and
+		// the final sliver of the lerp step would only be undone again.
+		// Pans made while magnified can sit outside the tightened bound —
+		// pull the camera in here, in one controlled clamp, instead of
+		// leaving it to an arbitrary later game move.
+		GameCamera::Reclamp();
+		g_cameraBusy = false;
+		return;
+	}
+
 	g_zoom.store(newZoom);
 	g_invZoom.store(1.0f / newZoom);
 
 	ApplyCameraStep(oldZoom, newZoom);
-
-	// Back at the native zoom the magnified view covers the whole view again,
-	// so the shift we accumulated while zoomed in is dropped here.
-	if (newZoom <= ZOOM_MIN && oldZoom > ZOOM_MIN)
-		UndoCameraOffset();
 
 	g_cameraBusy = false;
 }
@@ -254,19 +271,53 @@ void Zoomer::ApplyCameraStep(float oldZoom, float newZoom)
 
 	const POINT fixedPoint = { g_centerX.load(), g_centerY.load() };
 	const POINT shift = GameCamera::ComputeShift(focus, fixedPoint, oldZoom, newZoom);
-	if (shift.x == 0 && shift.y == 0) return;
+	if (shift.x == 0 && shift.y == 0)
+	{
+		// No focus shift to apply, but a zoom decrease still tightens the
+		// legal camera range (the source rect grows toward the full view):
+		// run the position through the game clamp so the camera can never
+		// sit outside the bounds the next step would use.
+		if (newZoom < oldZoom)
+			GameCamera::Reclamp();
+		return;
+	}
+
+	POINT before = {};
+	const bool haveBefore = GameCamera::Read(before);
 
 	if (GameCamera::ShiftBy(shift.x, shift.y))
 	{
-		g_camOffset.x += shift.x;
-		g_camOffset.y += shift.y;
-		LOG("camera shift (%ld,%ld) zoom %.3f -> %.3f offset (%ld,%ld) focus (%ld,%ld)",
+		// The game clamps every move against the map: record what actually
+		// moved, not what was asked for. A fake full-size entry would make
+		// the undo at ZOOM_MIN overshoot (and could never be paid back).
+		POINT after = {};
+		const bool haveAfter = haveBefore && GameCamera::Read(after);
+		if (haveAfter)
+		{
+			g_camOffset.x += after.x - before.x;
+			g_camOffset.y += after.y - before.y;
+		}
+		else
+		{
+			after = { before.x + shift.x, before.y + shift.y };
+			g_camOffset.x += shift.x;
+			g_camOffset.y += shift.y;
+		}
+		LOG("camera shift (%ld,%ld) zoom %.3f -> %.3f pos (%ld,%ld) -> (%ld,%ld) offset (%ld,%ld) focus (%ld,%ld)",
 			shift.x, shift.y, oldZoom, newZoom,
+			before.x, before.y, after.x, after.y,
 			g_camOffset.x, g_camOffset.y, focus.x, focus.y);
 	}
 	else
 	{
-		LOG("camera shift (%ld,%ld) rejected by the game", shift.x, shift.y);
+		POINT now = {};
+		const bool haveNow = GameCamera::Read(now);
+		LOG("camera shift (%ld,%ld) rejected by the game pos (%ld,%ld) target (%ld,%ld) zoom %.3f focus (%ld,%ld)",
+			shift.x, shift.y,
+			haveNow ? now.x : 0, haveNow ? now.y : 0,
+			haveNow ? now.x + shift.x : 0, haveNow ? now.y + shift.y : 0,
+			oldZoom, focus.x, focus.y);
+		RenderZoom::LogCameraClampState();
 	}
 }
 
@@ -283,16 +334,35 @@ void Zoomer::UndoCameraOffset()
 	const bool wasBusy = g_cameraBusy;
 	g_cameraBusy = true;
 
-	if (GameCamera::ShiftBy(-g_camOffset.x, -g_camOffset.y))
+	POINT before = {};
+	if (GameCamera::Read(before))
 	{
-		LOG("camera offset undone (%ld,%ld)", g_camOffset.x, g_camOffset.y);
-		g_camOffset = { 0, 0 };
+		const POINT target = { before.x - g_camOffset.x, before.y - g_camOffset.y };
+		GameCamera::WriteAbs(target);
+
+		// The game clamps the move against the map. Whatever part of the
+		// offset could not be paid back (the undo target lies beyond the
+		// bound) can never be paid back either — the same bound blocks
+		// every retry — and keeping it as a debt would make a LATER undo
+		// overshoot past the position the user expects, so it is dropped.
+		POINT after = {};
+		if (GameCamera::Read(after) && (after.x != target.x || after.y != target.y))
+		{
+			LOG("camera offset (%ld,%ld) only partially undone (%ld,%ld) at the map bound, remainder dropped",
+				g_camOffset.x, g_camOffset.y,
+				after.x - before.x, after.y - before.y);
+		}
+		else
+		{
+			LOG("camera offset undone (%ld,%ld)", g_camOffset.x, g_camOffset.y);
+		}
 	}
 	else
 	{
-		LOG("camera offset (%ld,%ld) could not be undone", g_camOffset.x, g_camOffset.y);
+		LOG("camera offset (%ld,%ld) dropped, the camera could not be read", g_camOffset.x, g_camOffset.y);
 	}
 
+	g_camOffset = { 0, 0 };
 	g_cameraBusy = wasBusy;
 }
 
@@ -339,11 +409,22 @@ void Zoomer::PanCamera(int dx, int dy)
 void Zoomer::ResetZoom()
 {
 	g_cameraBusy = true;
+	// Undo BEFORE the stored zoom drops to 1.0: ClampCoordMap's bound
+	// follows the zoom (relaxed to the source rect while magnified), and
+	// with the native zoom stored first the game would clamp the payback
+	// near the map edge — a partial undo that teleports the camera to the
+	// bound instead of walking the recorded offset back. The payback runs
+	// under the relaxed bound, then the tightened bound is enforced in one
+	// controlled step below.
+	UndoCameraOffset();
 	g_zoom.store(ZOOM_DEFAULT);
 	g_targetZoom.store(ZOOM_DEFAULT);
 	g_invZoom.store(1.0f);
 	g_focusValid = false;
-	UndoCameraOffset();
+	// Pans made while magnified may sit outside the native bound (the
+	// relaxed bound allowed them); pull the camera in here instead of
+	// leaving that to an arbitrary later game move.
+	GameCamera::Reclamp();
 	g_cameraBusy = false;
 
 	LOG("Zoom reset to %.1f", ZOOM_DEFAULT);

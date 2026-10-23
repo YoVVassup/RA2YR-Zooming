@@ -7,7 +7,7 @@
 [![平台](https://img.shields.io/badge/platform-Windows%20x86-0078D6?logo=windows&logoColor=white)](#-系统需求)
 [![游戏](https://img.shields.io/badge/game-C%26C%3A%20Yuri%27s%20Revenge-E6A23C)](#-系统需求)
 [![框架](https://img.shields.io/badge/framework-Syringe-7B68EE)](#-技术实现)
-[![测试](https://img.shields.io/badge/tests-69%20%E7%94%A8%E4%BE%8B%20%7C%20653%20%E6%96%AD%E8%A8%80-4CAF50)](#-状态)
+[![测试](https://img.shields.io/badge/tests-89%20%E7%94%A8%E4%BE%8B%20%7C%20955%20%E6%96%AD%E8%A8%80-4CAF50)](#-状态)
 [![Fork of](https://img.shields.io/badge/fork%20of-ChoyoTsumu%2FRA2--about-1f6feb?logo=github&logoColor=white)](https://github.com/ChoyoTsumu/RA2-about)
 
 ---
@@ -36,8 +36,8 @@
 
 ## ✅ 状态
 
-- 🧪 **单元测试：** 69 个测试用例 / 653 条断言 — `tests\bin\ViewCtrlTests.exe`
-- 📊 **行覆盖率：** `src/` 99.7%（OpenCppCoverage 对 doctest 套件实测；剩余部分是少数防御性 OS 失败分支）
+- 🧪 **单元测试：** 89 个测试用例 / 955 条断言 — `tests\bin\ViewCtrlTests.exe`
+- 📊 **行覆盖率：** `src/` 100% — 1495 行中的 1495 行（OpenCppCoverage 0.9.9 对 doctest 套件实测；只能在游戏中执行的分支——TextDefer 真实派发、clamp 状态诊断、OS 失败防御——通过测试接缝覆盖）
 - ⚠️ **自动检测竞争性缩放器**（详见 [docs/conflict-detection.md](docs/conflict-detection.md)）：当模组自行缩放视图时——`GScript.ext`（例如 Tiberium Crisis）、Telescope v1.4、Kaleidoscope、MOExperience 或 Ra2.Vampire.Zoom——`GameInt` 会发现并让 ViewCtrl 保持惰性。检测分层：**L1** 模块文件名，**L2** `.syhks00` 钩子表指纹，**L3** 运行时字节扫描检测外来 `E9` 补丁，**L4** 反应式视图尺寸监视，**L5** 专用导出探测——被改名或运行时打补丁的竞争者仍会被捕获
 - 🔬 **静态审计：** 每个钩子地址均已对照 YR Hook Encyclopedia 验证——对 Syringe 存根安全（被盗窗口内无相对跳转，恢复地址位于指令边界），钩子注册表无冲突；引导钩子 `0x52CAE9` 与 Ares 共享（`_YR_PostGameInit`）且可正确组合
 - 🖥 **渲染顺序经反汇编验证：** 放大发生在游戏绘制到 `DSurface::Composite` 之后、光标位块传输之前、`Frame::Present` 之前——到达屏幕的是放大后的像素
@@ -116,22 +116,26 @@ tests\bin\ViewCtrlTests.exe
 
 ## ⚙️ 技术实现
 
-- **注入框架：** Syringe `DEFINE_HOOK` — 9 个钩子，所有地址集中于 `src\GameAddrs.hpp` 并附有来源注释（YRpp / ReSource / Encyclopedia）
+- **注入框架：** Syringe `DEFINE_HOOK` — 17 个钩子，所有地址集中于 `src\GameAddrs.hpp` 并附有来源注释（YRpp / ReSource / Encyclopedia）
 
 | 地址 | 字节 | 用途 |
 |------|------|------|
 | `0x52CAE9` | 5 | 游戏初始化后的引导钩子（`InitGame`）——与 Ares 共享，可组合 |
-| `0x4F44AF` | 5 | 渲染前：恢复干净的视图备份，推进缩放插值 |
-| `0x4F451B` | 5 | 渲染后：放大已绘制的视图 |
+| `0x4F44AF` | 5 | 渲染前：替换视图尺寸以让引擎绘制小视图；推进缩放插值 |
+| `0x4F451B` | 5 | 渲染后：将小视图拉伸至全帧并恢复原始视图尺寸 |
 | `0x6D864E` / `0x6D868A` | 6 | `ClampCoordMap` — 视图宽高读取被限制在放大的源矩形内（回退到最近一次有效尺寸） |
 | `0x692325` | 6 | `DisplayClass::ProcessClickCoords` — 战术点击变换 |
 | `0x6D9F80` / `0x6D9FC0` | 6 | 框选矩形起点/终点变换 |
 | `0x693791` | 6 | `ScrollMapEdge` — 右键拖动滚动速度变换 |
+| `0x6A71D0` … `0x6A7439` | 6 | `BlitSidebar` — 五处 `ViewBounds.W` 读取固定为真实视图宽度，替换生效时侧边栏不移位 |
+| `0x6D4B50` | 6 | `TacticalClass::DrawTimer` — HUD 计时器绘制被推迟，拉伸后按原始尺寸重放 |
+| `0x6D4E20` | 5 | `TacticalClass::DrawScreenText` — 屏幕文本同样推迟并重放 |
+| `0x4F44F9` | 12 | `GScreenClass::Render` — DrawUI 虚函数调用整窗跳过；整个 UI 流程在拉伸后重放 |
 
-- **渲染路径（经反汇编验证）：** `MainLoop` → `GScreenClass::Render`（`0x4F4480`）将帧绘制到 `DSurface::Composite` → ViewCtrl 放大 → `wwmouse->DrawCursorBuffered` 位块传输未缩放的光标 → 虚函数 `RenderFrame` → `Frame::Present`
+- **渲染路径（经反汇编验证）：** `MainLoop` → `GScreenClass::Render`（`0x4F4480`）绘制帧——缩放时为替换后的小视图——到 `DSurface::Composite` → ViewCtrl 将其拉伸至完整视图 → `wwmouse->DrawCursorBuffered` 位块传输未缩放的光标 → 虚函数 `RenderFrame` → `Frame::Present`
 - **输入：** 子类化游戏窗口过程（`SetWindowLongPtrW`）；仅当按住 Ctrl 且光标位于战术视图上时滚轮才进行缩放，其余全部转发给游戏；光标自身位置从不重映射
 - **摄像机：** 每次缩放步进都移动游戏摄像机（`TacticalMapClass::SetCameraPosition`，`0x6D6000`），使焦点保持在光标下；回到 1.0× 时撤销偏移
-- **视图矩形：** `DSurface::ViewBounds`，轮询间隔不超过 250 毫秒，且仅在未处于放大状态时接受；矩形本身不包含侧边栏
+- **视图矩形：** `DSurface::ViewBounds`，轮询间隔不超过 250 毫秒，且在任何尺寸仍为原始值的帧上进行——包括放大会话中的帧，因此会话的首次缩放绝不会按原始客户区矩形渲染；矩形本身不包含侧边栏
 - **坐标变换：** 游戏把屏幕坐标转换为游戏空间的位置会被反向缩放；`Zoomer::UnMagnify` 是渲染器拉伸的精确逆变换
 - **健壮性：** 每个钩子函数体均用 SEH（`src\Seh.h`）包裹，异常被吞掉并重放原始字节；Release 日志默认关闭，可在运行时通过 `VIEWCTRL_LOG=1` 开启
 

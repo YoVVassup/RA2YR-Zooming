@@ -5,21 +5,24 @@
 // Detection of competing view scalers.
 //
 // Big mods ship their own zoom: GScript.ext scales the view for the
-// Tiberium Crisis mod, Telescope v1.4 bundles a fork of these very nine
-// hooks, Kaleidoscope and MOExperience rescale the tactical view themselves,
-// and Ra2.Vampire.Zoom switches the video mode through a cnc-ddraw fork.
-// Two scalers transforming the same frame would double-magnify and fight
-// over the coordinate un-mapping, so GameInt calls Present() before
-// Zoomer::Init() and leaves this plugin inert when a competitor is loaded:
-// no init thread, no window subclass, and every hook keeps replaying the
-// original instructions.
+// Tiberium Crisis mod, Telescope v1.4 bundles a fork of this zoom
+// pipeline, Kaleidoscope and MOExperience rescale the tactical view
+// themselves, and Ra2.Vampire.Zoom switches the video mode through a
+// cnc-ddraw fork. Two scalers transforming the same frame would
+// double-magnify and fight over the coordinate un-mapping, so GameInt
+// calls Present() before Zoomer::Init() and leaves this plugin inert when
+// a competitor is loaded: no init thread, no window subclass, and every
+// hook keeps replaying the original instructions.
 //
 // Detection is layered so no known scaling mechanism slips through:
 //
 //   L1  module file name - the five known scaler file names.
-//   L2  .syhks00 table   - any foreign module claiming one of our eight
-//                          non-Ares hook sites re-implements this pipeline
-//                          (Kaleidoscope claims six, Telescope all nine).
+//   L2  .syhks00 table   - any foreign module claiming one of our
+//                          scaler-fingerprint hook sites (render, clamp,
+//                          coordinate paths — Kaleidoscope claims six,
+//                          Telescope the whole older set) re-implements
+//                          this pipeline. The Ares init site is
+//                          framework-shared and never counts.
 //   L3  runtime bytes    - a foreign module that JMP-patched one of those
 //                          sites after Syringe installed our hooks
 //                          (MOExperience rewrites 0x4F451B from its DllMain
@@ -48,8 +51,9 @@ bool ModuleExportsScaler(HMODULE mod);
 
 // True when the PE image at `image` declares at least `minClaimed` of
 // [sites, sites + count) in its .syhks00 section. A plugin that re-implements
-// that much of our hook set is another scaler (Telescope claims all nine);
-// ordinary framework plugins share at most the single Ares site.
+// that much of our hook set is another scaler (Telescope claims the whole
+// set); ordinary framework plugins share at most the framework-shared
+// site (the Ares init hook).
 bool ImageClaimsScalerShare(const unsigned char* image,
 	const unsigned int* sites, unsigned int count,
 	unsigned int minClaimed = 3);
@@ -98,8 +102,10 @@ void ResetReactive();
 bool Present();
 
 #ifdef VIEWCTRL_TEST
-// Force-fail seam so the OwnImage OS-failure branch is reachable under unit tests.
+// Force-fail seams so the OwnImage and EnumProcessModules OS-failure
+// branches are reachable under unit tests.
 void SetFailOwnImageForTest(bool fail);
+void SetFailEnumModulesForTest(bool fail);
 #endif
 
 } // namespace ScalerConflict

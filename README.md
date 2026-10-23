@@ -7,7 +7,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%20x86-0078D6?logo=windows&logoColor=white)](#requirements)
 [![Game](https://img.shields.io/badge/game-C%26C%3A%20Yuri%27s%20Revenge-E6A23C)](#requirements)
 [![Framework](https://img.shields.io/badge/framework-Syringe-7B68EE)](#technical-implementation)
-[![Tests](https://img.shields.io/badge/tests-69%20cases%20%7C%20653%20assertions-4CAF50)](#status)
+[![Tests](https://img.shields.io/badge/tests-89%20cases%20%7C%20955%20assertions-4CAF50)](#status)
 [![Fork of](https://img.shields.io/badge/fork%20of-ChoyoTsumu%2FRA2--about-1f6feb?logo=github&logoColor=white)](https://github.com/ChoyoTsumu/RA2-about)
 
 ---
@@ -36,8 +36,8 @@ Built on the **Windows API** with **Syringe** (the injection framework used by A
 
 ## ✅ Status
 
-- 🧪 **Unit tests:** 69 test cases / 653 assertions — `tests\bin\ViewCtrlTests.exe`
-- 📊 **Line coverage:** 99.7% of `src/` (measured with OpenCppCoverage over the doctest suite; the remainder is a few defensive OS-failure branches)
+- 🧪 **Unit tests:** 89 test cases / 955 assertions — `tests\bin\ViewCtrlTests.exe`
+- 📊 **Line coverage:** 100% of `src/` — 1495 of 1495 lines (OpenCppCoverage 0.9.9 over the doctest suite; the production-only branches — TextDefer's real dispatch, clamp-state diagnostics, OS-failure defenses — are reached through test seams)
 - ⚠️ **Competing scalers auto-detected** (see [docs/conflict-detection.md](docs/conflict-detection.md)): when the mod scales the view itself — `GScript.ext` (e.g. Tiberium Crisis), Telescope v1.4, Kaleidoscope, MOExperience or Ra2.Vampire.Zoom — `GameInt` notices and keeps ViewCtrl inert. Detection is layered: **L1** module file name, **L2** `.syhks00` hook-table fingerprint, **L3** runtime byte sniff for foreign `E9` patches, **L4** reactive view-size watch, **L5** scaler-specific export probe — a renamed or runtime-patched competitor is still caught
 - 🔬 **Static audit:** every hook site was verified against the YR Hook Encyclopedia — Syringe-stub safe (no relative branches inside the stolen windows, resume addresses on instruction boundaries), no registry conflicts; the bootstrap hook `0x52CAE9` is shared with Ares (`_YR_PostGameInit`) and composes with it
 - 🖥 **Render order verified by disassembly:** magnification runs after the game draws into `DSurface::Composite`, before the cursor blit and before `Frame::Present` — the magnified pixels are what reaches the screen
@@ -116,22 +116,26 @@ Without Ctrl the wheel is passed to the game untouched. All zoom parameters are 
 
 ## ⚙️ Technical Implementation
 
-- **Injection framework:** Syringe `DEFINE_HOOK` — 9 hooks, all addresses centralized in `src\GameAddrs.hpp` with source annotations (YRpp / ReSource / Encyclopedia)
+- **Injection framework:** Syringe `DEFINE_HOOK` — 17 hooks, all addresses centralized in `src\GameAddrs.hpp` with source annotations (YRpp / ReSource / Encyclopedia)
 
 | Site | Bytes | Purpose |
 |------|-------|---------|
 | `0x52CAE9` | 5 | bootstrap after game init (`InitGame`) — Ares-shared, composes |
-| `0x4F44AF` | 5 | pre-render: restore the clean view backup, tick the zoom lerp |
-| `0x4F451B` | 5 | post-render: magnify the drawn view |
+| `0x4F44AF` | 5 | pre-render: substitute the view dimensions so the engine draws the small view; tick the zoom lerp |
+| `0x4F451B` | 5 | post-render: stretch the small view over the frame and restore the vanilla view dimensions |
 | `0x6D864E` / `0x6D868A` | 6 | `ClampCoordMap` — view width/height reads clamped to the magnified source rect (falls back to the last good size) |
 | `0x692325` | 6 | `DisplayClass::ProcessClickCoords` — tactical click transform |
 | `0x6D9F80` / `0x6D9FC0` | 6 | selection rubber band start/end transform |
 | `0x693791` | 6 | `ScrollMapEdge` — right-drag scroll speed transform |
+| `0x6A71D0` … `0x6A7439` | 6 | `BlitSidebar` — five `ViewBounds.W` reads pinned to the real view width so the sidebar holds its place while the view is substituted |
+| `0x6D4B50` | 6 | `TacticalClass::DrawTimer` — HUD timer draw deferred and replayed at native size after the stretch |
+| `0x6D4E20` | 5 | `TacticalClass::DrawScreenText` — screen text deferred and replayed the same way |
+| `0x4F44F9` | 12 | `GScreenClass::Render` — the DrawUI virtual call skipped as one window; the whole UI pass replays after the stretch |
 
-- **Render path (verified by disassembly):** `MainLoop` → `GScreenClass::Render` (`0x4F4480`) draws the frame into `DSurface::Composite` → ViewCtrl magnifies → `wwmouse->DrawCursorBuffered` blits the unscaled cursor → virtual `RenderFrame` → `Frame::Present`
+- **Render path (verified by disassembly):** `MainLoop` → `GScreenClass::Render` (`0x4F4480`) draws the frame — the substituted small view while zoomed — into `DSurface::Composite` → ViewCtrl stretches it up to the full view → `wwmouse->DrawCursorBuffered` blits the unscaled cursor → virtual `RenderFrame` → `Frame::Present`
 - **Input:** subclasses the game window procedure (`SetWindowLongPtrW`); the wheel zooms only while Ctrl is held and the cursor is over the tactical view, everything else is forwarded to the game; the cursor position itself is never remapped
 - **Camera:** every zoom step moves the game camera (`TacticalMapClass::SetCameraPosition`, `0x6D6000`) so the focused point stays under the cursor; the offset is undone at 1.0x
-- **View rect:** `DSurface::ViewBounds`, polled at most every 250 ms and accepted only while nothing is magnified; the rect itself excludes the sidebar
+- **View rect:** `DSurface::ViewBounds`, polled at most every 250 ms on any frame whose dimensions are currently vanilla — including frames of a magnified session, so the first zoom of a session never renders against the raw client rect; the rect itself excludes the sidebar
 - **Coordinate transforms:** the points where the game turns screen positions into game space are un-magnified; `Zoomer::UnMagnify` is the exact inverse of the upscale the renderer draws
 - **Robustness:** every hook body is wrapped in SEH (`src\Seh.h`) so a fault is swallowed and the original bytes are replayed; Release logging is off by default and can be toggled at runtime with `VIEWCTRL_LOG=1`
 

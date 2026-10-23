@@ -35,6 +35,14 @@ namespace GameCamera
 	// (disabled, no instance, or the camera did not end up where asked).
 	bool ShiftBy(int dx, int dy);
 
+	// Read + write the current position back through SetCameraPosition, so
+	// the game re-runs its clamp (SetCameraPosition always pipes the point
+	// through ClampCoordMap). Needed when the legal camera range tightens
+	// without a shift being applied — a zoom decrease with the focus at the
+	// view center leaves the camera where the wider (zoomed) bound allowed
+	// it, and nothing else would put it back inside the new bound.
+	bool Reclamp();
+
 #ifdef VIEWCTRL_TEST
 	// Test seams: arm the wrapper without gamemd.exe (Enable() refuses outside
 	// the game module), point the TacticalClass instance at a fake object
@@ -47,5 +55,10 @@ namespace GameCamera
 	// the success and the unexpected-prologue paths can run outside the game.
 	// Pass null to restore the real SetCameraPosition address.
 	void SetCameraProbeAddressForTest(const void* address);
+	// Makes the next Read() fail once (the flag clears itself): the branch
+	// ApplyCameraStep takes when the camera cannot be re-read after a shift
+	// is otherwise unreachable, since its own checks require every read to
+	// succeed.
+	void SetFailNextReadForTest(bool fail);
 #endif
 }

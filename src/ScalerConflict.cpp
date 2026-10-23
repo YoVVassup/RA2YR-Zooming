@@ -32,21 +32,25 @@ namespace {
 		"exfunc_get_zoom_factor",
 	};
 
-	// A single shared hook site is normal between YR framework plugins only
-	// on 0x52CAE9 (Ares is documented to sit there); any of the other eight
-	// sites is exclusive to zoom pipelines, so Present() asks for one.
+	// Sharing a hook site is normal between YR framework plugins on the
+	// Ares init site (0x52CAE9). Every fingerprint site below is exclusive
+	// to zoom pipelines, so Present() asks for one of those.
 	constexpr unsigned int kMinClaimedSites = 3;
 	constexpr unsigned int kPresentMinClaimedSites = 1;
 
-	// GameInt (0x52CAE9) is deliberately absent: Ares shares it, every
-	// framework plugin may. The remaining eight sites are the scaler
-	// fingerprint.
+	// Framework-shared sites, excluded from the scaler fingerprint: the
+	// GameInt init site (0x52CAE9, Ares sits there, every framework plugin
+	// may). The remaining sites — render, clamp, coordinate, HUD defer —
+	// are the scaler fingerprint.
 	constexpr unsigned int kAresSite = 0x52CAE9u;
+	constexpr unsigned int kSharedSites[] = {
+		kAresSite,
+	};
 
 	// hookdecl is align(16)/pack(16): {hookAddr, hookSize, name ptr, pad}.
 	constexpr unsigned int kHookDeclSize = 16;
 
-	constexpr unsigned int kMaxOurSites = 16;
+	constexpr unsigned int kMaxOurSites = 20;
 
 	// A view dimension that stays displaced this long while the window size
 	// holds still is a foreign scaler, not a transient engine update.
@@ -87,7 +91,6 @@ namespace {
 				if (fn(addr))
 					return true;
 			}
-			return false;
 		}
 		return false;
 	}
@@ -95,19 +98,22 @@ namespace {
 	// Resolves the image base of the module this code is linked into
 	// (ViewCtrl.dll in the game, the test executable under the unit tests).
 #ifdef VIEWCTRL_TEST
-	// Force-fail seam for GetModuleHandleEx on our own image.
+	// Force-fail seams for the two OS calls OwnImage/Present make:
+	// GetModuleHandleEx on our own image, and EnumProcessModules.
 	bool g_failOwnImage = false;
+	bool g_failEnumModules = false;
 #endif
 
 	const unsigned char* OwnImage()
 	{
-#ifdef VIEWCTRL_TEST
-		if (g_failOwnImage)
-			return nullptr;
-#endif
 		HMODULE self = nullptr;
-		if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-			reinterpret_cast<LPCSTR>(&OwnImage), &self))
+		BOOL ok = FALSE;
+#ifdef VIEWCTRL_TEST
+		if (!g_failOwnImage)
+#endif
+			ok = GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+				reinterpret_cast<LPCSTR>(&OwnImage), &self);
+		if (!ok)
 			return nullptr;
 		return reinterpret_cast<const unsigned char*>(self);
 	}
@@ -126,7 +132,8 @@ namespace {
 		return start + bytes <= regionEnd;
 	}
 
-	// The eight scaler-fingerprint sites: OwnHookSites() minus 0x52CAE9.
+	// The scaler-fingerprint sites: OwnHookSites() minus the shared ones
+	// (the Ares init site — every framework plugin may claim it).
 	unsigned int FingerprintSites(unsigned int* out, unsigned int cap)
 	{
 		unsigned int all[kMaxOurSites] = {};
@@ -134,7 +141,16 @@ namespace {
 		unsigned int kept = 0;
 		for (unsigned int i = 0; i < n && kept < cap; ++i)
 		{
-			if (all[i] == kAresSite)
+			bool shared = false;
+			for (unsigned int s : kSharedSites)
+			{
+				if (all[i] == s)
+				{
+					shared = true;
+					break;
+				}
+			}
+			if (shared)
 				continue;
 			out[kept++] = all[i];
 		}
@@ -283,8 +299,8 @@ bool SiteHookedForeign(uintptr_t siteAddr)
 
 bool RuntimePatchPresent()
 {
-	unsigned int sites[16] = {};
-	const unsigned int n = FingerprintSites(sites, 16);
+	unsigned int sites[kMaxOurSites] = {};
+	const unsigned int n = FingerprintSites(sites, kMaxOurSites);
 	for (unsigned int i = 0; i < n; ++i)
 	{
 		if (SiteHookedForeign(sites[i]))
@@ -349,6 +365,11 @@ void SetFailOwnImageForTest(bool fail)
 {
 	g_failOwnImage = fail;
 }
+
+void SetFailEnumModulesForTest(bool fail)
+{
+	g_failEnumModules = fail;
+}
 #endif
 
 bool Present()
@@ -363,7 +384,12 @@ bool Present()
 	// loaded without a full LoadLibrary path); Toolhelp can miss those.
 	HMODULE mods[256] = {};
 	DWORD needed = 0;
-	if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed))
+	BOOL enumOk = FALSE;
+#ifdef VIEWCTRL_TEST
+	if (!g_failEnumModules)
+#endif
+		enumOk = EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed);
+	if (!enumOk)
 		return false;
 	const unsigned int count = (needed > sizeof(mods))
 		? (unsigned)(sizeof(mods) / sizeof(mods[0]))
@@ -394,7 +420,7 @@ bool Present()
 			found = true;
 			break;
 		}
-		// L2: any of the eight fingerprint sites in the foreign
+		// L2: any of the fingerprint sites in the foreign
 		// .syhks00 table.
 		if (siteCount
 			&& ImageClaimsScalerShare(reinterpret_cast<const unsigned char*>(mod),

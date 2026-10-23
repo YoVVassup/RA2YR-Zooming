@@ -13,6 +13,13 @@
 //                     full view area inside DSurface::Composite, then put
 //                     the vanilla view dimensions back.
 //
+// The substitution mirrors the game's own Set_View_Dimensions (0x4A8960):
+// both the DSurface pair and TacticalClass::view_bound (0xB0CE28) are
+// written, and CalcViewportCells (0x6D8B30) is re-run so TacticalPos
+// follows the smaller rect. Skipping the second half leaves the engine
+// rendering the source rect at the full-view origin — the map cut off at
+// the bottom and the right once the camera sits near a map edge.
+//
 // The engine owning the zoomed render is what Kaleidoscope does: overlays,
 // smudge and selection markers drawn inside the view come out consistent by
 // construction, the backup buffer shrinks to the source rect, and the game
@@ -21,9 +28,11 @@
 // frame the engine already rendered small.
 //
 // The view rect comes from DSurface::ViewBounds, polled at most every 250 ms
-// and only while the zoom factor is back at 1.0. While the dimensions are
-// substituted the ScalerConflict L4 watch is fed the vanilla pair only, so
-// the plugin never trips over its own scaling.
+// on every frame whose dimensions are currently vanilla — including frames
+// of a magnified session, so the first zoom of a session does not render
+// against the raw client rect. While the dimensions are substituted the
+// ScalerConflict L4 watch is fed the vanilla pair only, so the plugin never
+// trips over its own scaling.
 class RenderZoom
 {
 public:
@@ -93,6 +102,20 @@ public:
 	// dimension only while the view is magnified.
 	static int ClampDimension(int gameDim, int srcDim, bool magnified);
 
+	// One diagnostic line behind a rejected camera focus shift: the zoom,
+	// the values the ClampCoordMap hooks feed the game right now, their
+	// entry counters (0 = the hook never ran) and the map globals
+	// ClampCoordMap builds its bounds from. Guards the game addresses
+	// with IsGameReadable, so tests stay safe.
+	static void LogCameraClampState();
+
+	// The real (unsubstituted) DSurface::ViewBounds.W, read through the
+	// five BlitSidebar hook sites. While the view is magnified the game
+	// global holds the smaller source rect; the sidebar blit must still
+	// position against the full view width so it does not shift into the
+	// map area.
+	static int SidebarViewWidth();
+
 	// Drops the backup buffer and the debounced view rect (tests / shutdown).
 	static void ResetFrameState();
 
@@ -109,6 +132,15 @@ public:
 	static void SetTestGameRegion(void* moduleBase, const void* compositeSlot,
 		const void* viewBounds, const void* windowBounds);
 
+	// Redirects the TacticalClass view_bound cache (GameAddr 0xB0CE28), the
+	// TacticalClass instance slot and the CalcViewportCells entry the same
+	// way; PreRender/PostRender keep the cache in sync with ViewBounds and
+	// recompute TacticalPos through this triple. Nulls restore the real
+	// addresses (and make the recompute a no-op outside the game).
+	// tacticalInstanceSlot points at a void* slot (not at the instance).
+	static void SetViewBoundForTest(const void* viewBound,
+		void* tacticalInstanceSlot, void* calcViewportCells);
+
 	// Address the WindowBounds reads go through: the game global by default,
 	// the test region after SetTestGameRegion (Zoomer::DefaultViewRect).
 	static const void* TestWindowBoundsAddress();
@@ -116,5 +148,10 @@ public:
 	// Pins the L3 patch-scan timestamp so the next PreRender always scans
 	// (or forces the scan to look stale).
 	static void SetLastPatchScanForTest(DWORD ms);
+
+	// Redirects the five map cell-extent globals LogCameraClampState reads
+	// (ClampCoordMap's bound inputs) into readable memory; null restores
+	// the real addresses.
+	static void SetMapBoundsForTest(const void* addrs[5]);
 #endif
 };

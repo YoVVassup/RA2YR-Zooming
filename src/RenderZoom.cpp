@@ -1,6 +1,7 @@
 #include "RenderZoom.hpp"
 #include "Zoomer.hpp"
 #include "ScalerConflict.hpp"
+#include "TextDefer.hpp"
 #include "GameAddrs.hpp"
 #include "Log.h"
 
@@ -17,11 +18,11 @@ namespace
 	constexpr int VT_GET_WIDTH = 31;
 	constexpr int VT_GET_HEIGHT = 32;
 
-	// The view rect is only looked at while the zoom factor sits at 1.0, and
-	// at most four times a second.
+	// The vanilla view rect is observed at most four times a second, on
+	// every frame whose view dimensions are not substituted (see PreRender).
 	constexpr DWORD VIEW_RECT_POLL_MS = 250;
 
-	// How often the eight scaler-fingerprint hook sites are re-checked for a
+	// How often the scaler-fingerprint hook sites are re-checked for a
 	// foreign runtime patch (MOExperience re-patches when ScaleBar toggles).
 	constexpr DWORD PATCH_SCAN_MS = 1000;
 
@@ -30,6 +31,7 @@ namespace
 	using SurfaceIntFn = int(__thiscall*)(void*);
 	using SurfaceLockFn = void*(__thiscall*)(void*, int, int);
 	using SurfaceUnlockFn = bool(__thiscall*)(void*);
+	using CalcViewportCellsFn = void(__thiscall*)(void* self);
 
 	bool g_enabled = false;
 
@@ -55,6 +57,12 @@ namespace
 	bool g_viewRectValid = false;
 	DWORD g_lastViewPoll = 0;
 
+	// Entry counters of the two ClampCoordMap hooks (Main.cpp). A rejected
+	// camera shift logs them: zero means the syhks declaration never made
+	// it into this process and the game clamped against the full view.
+	unsigned long g_clampHookCallsW = 0;
+	unsigned long g_clampHookCallsH = 0;
+
 	// Indirection over the hard coded game globals: the defaults are the
 	// production addresses, SetTestGameRegion (VIEWCTRL_TEST) redirects them
 	// into a region the test owns so IsGameReadable accepts it.
@@ -62,6 +70,31 @@ namespace
 	const void* g_compositeSlot = reinterpret_cast<const void*>(GameAddr::DSurface_Composite);
 	const void* g_viewBounds = reinterpret_cast<const void*>(GameAddr::DSurface_ViewBounds);
 	const void* g_windowBounds = reinterpret_cast<const void*>(GameAddr::DSurface_WindowBounds);
+
+	// TacticalClass's own view_bound cache (RectangleStruct at
+	// GameAddr::TacticalClass_viewBound). Set_View_Dimensions writes it
+	// together with DSurface::ViewBounds; CalcViewportCells builds the
+	// viewport origin from its W/H, so a substitution that touches only the
+	// DSurface pair leaves the engine rendering the small rect at the
+	// full-view origin (map cut off at the bottom and right). These three
+	// follow the viewBounds indirection so tests can redirect them.
+	const void* g_viewBound = reinterpret_cast<const void*>(GameAddr::TacticalClass_viewBound);
+	const void* g_tacticalInstanceSlot = reinterpret_cast<const void*>(GameAddr::TacticalClass_Instance);
+	CalcViewportCellsFn g_calcViewportCells =
+		reinterpret_cast<CalcViewportCellsFn>(GameAddr::TacticalClass_CalcViewportCells);
+
+	// ClampCoordMap's five map cell-extent inputs ([0x87F8DC, 0x87F8E4,
+	// 0x87F8E8, 0x87F8EC, 0x87F8F0]): LogCameraClampState reads them for
+	// the diagnostic. Unreadable outside gamemd.exe (logged as zeros then);
+	// SetMapBoundsForTest (VIEWCTRL_TEST) points them at readable memory so
+	// the read path runs under unit tests. Null restores the defaults.
+	constexpr uintptr_t kMapAddrDefaults[5] = {
+		0x87F8DCu, 0x87F8E4u, 0x87F8E8u, 0x87F8ECu, 0x87F8F0u
+	};
+	uintptr_t g_mapAddrs[5] = {
+		kMapAddrDefaults[0], kMapAddrDefaults[1], kMapAddrDefaults[2],
+		kMapAddrDefaults[3], kMapAddrDefaults[4]
+	};
 
 	bool IsReadable(const void* address, size_t bytes)
 	{
@@ -149,6 +182,67 @@ namespace
 		return true;
 	}
 
+	// The W/H half of TacticalClass::view_bound (GameAddr 0xB0CE28 + 8/12).
+	// Written together with WriteViewDims by the game's own Set_View_Dimensions
+	// path (0x4A8960 -> 0x6D5F60); the plugin has to keep the pair in lockstep
+	// or CalcViewportCells keeps the full-view viewport origin.
+	bool WriteViewBoundCache(int w, int h)
+	{
+		if (!RenderZoom::IsGameReadable(g_viewBound, 4 * sizeof(int))) return false;
+
+		MEMORY_BASIC_INFORMATION mbi = {};
+		if (VirtualQuery(g_viewBound, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+		const DWORD prot = mbi.Protect & 0xFF;
+		if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE) return false;
+
+		int* p = reinterpret_cast<int*>(const_cast<void*>(g_viewBound));
+		p[2] = w;
+		p[3] = h;
+		return true;
+	}
+
+	// TacticalClass::CalcViewportCells (GameAddr 0x6D8B30): TacticalPos
+	// (this+0xB0/0xB4) = view center (this+0xD64/0xD68) - view_bound.W/H / 2.
+	// The engine runs it whenever the camera or the view dimensions change
+	// (SetCameraPosition, Set_View_Dimensions); substituting the dims behind
+	// its back needs the same recompute or the small render stays anchored at
+	// the full-view origin. Optional out params report the resulting origin.
+	bool RecalcViewport(int* outPosX, int* outPosY)
+	{
+		if (outPosX) *outPosX = 0;
+		if (outPosY) *outPosY = 0;
+		if (!g_calcViewportCells) return false;
+		if (!RenderZoom::IsGameReadable(g_tacticalInstanceSlot, sizeof(void*)))
+			return false;
+
+		void* instance = *reinterpret_cast<void* const*>(
+			const_cast<void*>(g_tacticalInstanceSlot));
+		// The instance is HEAP allocated (operator new of 0xE18 bytes at
+		// 0x687604, stored into the slot), so IsGameReadable's
+		// AllocationBase == gamemd.exe test rejects it by design — the same
+		// reason GameCamera dereferences TacticalClass::Instance with only a
+		// null check. The plain committed-page test is the right guard here;
+		// with the strict one this whole function silently no-oped and the
+		// full-view origin bug survived the first fix attempt.
+		// Size through this+0xD8C: the tail fields CalcViewportCells derives
+		// from the cache (scroll extents) sit right after the camera center.
+		if (!instance || !IsReadable(instance, 0xD90)) return false;
+
+		g_calcViewportCells(instance);
+		if (outPosX)
+			*outPosX = *reinterpret_cast<const int*>(
+				static_cast<const BYTE*>(instance) + 0xB0);
+		if (outPosY)
+			*outPosY = *reinterpret_cast<const int*>(
+				static_cast<const BYTE*>(instance) + 0xB4);
+		return true;
+	}
+
+	bool RecalcViewport()
+	{
+		return RecalcViewport(nullptr, nullptr);
+	}
+
 	bool LockView(const RECT& view, void*& pixels, int& pitch)
 	{
 		void* surface = CompositeSurface();
@@ -186,14 +280,39 @@ namespace
 
 	// Puts the vanilla view dimensions back. Only meaningful while a
 	// substitution is active; silently succeeds when the globals are gone.
+	// The TacticalClass view_bound cache goes back with them and the
+	// viewport origin is recomputed, so the between-frame coordinate paths
+	// (clicks, HUD, edge scroll) see one consistent vanilla pair again.
 	void RestoreViewDims()
 	{
 		if (WriteViewDims(g_savedViewW, g_savedViewH))
+		{
+			WriteViewBoundCache(g_savedViewW, g_savedViewH);
+			RecalcViewport();
 			g_substituted = false;
+		}
 	}
 
 	// Everything the replaced "mov ebx, [0x886FA8]" / "[0x886FAC]" would have
-	// loaded, swapped for the visible source rect while the view is magnified.
+	// loaded. ClampCoordMap uses this value to clamp the camera against the
+	// map. While magnified the displayed window is the smaller source rect
+	// centered at the camera, so the bound has to use THAT size: a full view
+	// bound would reject the focus shifts a zoom-in asks for near the map
+	// edge (the focus point would drift off the cursor). The bound tightens
+	// back to the full view as the zoom returns to 1 — every camera write
+	// goes through ClampCoordMap with the then-current zoom, and the zoom
+	// decrease path in ApplyCameraStep re-runs the position through the
+	// clamp even when the focus itself does not move.
+	//
+	// The source size is derived straight from the dimension read above:
+	// while a frame substitution is active the global already holds the
+	// source rect size (PreRender wrote it), otherwise it holds the full
+	// view and the zoom factor scales it down. The polled view rect is
+	// deliberately not consulted — it can still be empty on the first zoom
+	// of a session (the game may sit at a screen where view == window and
+	// the poll rejects the rect, then the user zooms before the next native
+	// frame), and waiting for it would clamp against the full view: the
+	// invisible wall at the map corner.
 	int ClampViewDimension(bool width)
 	{
 		static int lastWidth = 640;
@@ -209,19 +328,15 @@ namespace
 		const float zoom = Zoomer::CurrentZoom();
 		if (zoom <= ZOOM_EPSILON) return gameDim;
 
-		// Substitute only once a view rect has been observed; before that
-		// the game dimension stands.
-		RECT view = {};
-		if (!RenderZoom::CachedViewRect(view)) return gameDim;
+		// PreRender substituted this frame: the global already holds the
+		// source rect size the bound needs.
+		if (g_substituted) return gameDim;
 
-		const int viewW = view.right - view.left;
-		const int viewH = view.bottom - view.top;
-		if (viewW <= 0 || viewH <= 0) return gameDim;
-
-		const POINT anchor = Zoomer::ZoomAnchor();
-		const RenderZoom::SourceRect src = RenderZoom::ComputeSourceRect(
-			viewW, viewH, anchor.x - view.left, anchor.y - view.top, zoom);
-		return RenderZoom::ClampDimension(gameDim, width ? src.W : src.H, true);
+		// Full view still in place: the window actually displayed at this
+		// zoom is the view scaled by 1/zoom (rounded half up, matching
+		// ComputeSourceRect; a +-1 px difference does not move the bound).
+		const int srcDim = (int)floorf((float)gameDim / zoom + 0.5f);
+		return RenderZoom::ClampDimension(gameDim, srcDim, true);
 	}
 
 	// Shuts the plugin down from inside the game: unsubstitutes the view
@@ -300,6 +415,32 @@ void RenderZoom::SetTestGameRegion(void* moduleBase, const void* compositeSlot, 
 	g_windowBounds = reinterpret_cast<const void*>(GameAddr::DSurface_WindowBounds);
 }
 
+void RenderZoom::SetViewBoundForTest(const void* viewBound,
+	void* tacticalInstanceSlot, void* calcViewportCells)
+{
+	g_viewBound = viewBound
+		? viewBound
+		: reinterpret_cast<const void*>(GameAddr::TacticalClass_viewBound);
+	g_tacticalInstanceSlot = tacticalInstanceSlot
+		? tacticalInstanceSlot
+		: reinterpret_cast<const void*>(GameAddr::TacticalClass_Instance);
+	g_calcViewportCells = calcViewportCells
+		? reinterpret_cast<CalcViewportCellsFn>(calcViewportCells)
+		: reinterpret_cast<CalcViewportCellsFn>(GameAddr::TacticalClass_CalcViewportCells);
+}
+
+void RenderZoom::SetMapBoundsForTest(const void* addrs[5])
+{
+	if (!addrs)
+	{
+		for (int i = 0; i < 5; ++i)
+			g_mapAddrs[i] = kMapAddrDefaults[i];
+		return;
+	}
+	for (int i = 0; i < 5; ++i)
+		g_mapAddrs[i] = reinterpret_cast<uintptr_t>(addrs[i]);
+}
+
 const void* RenderZoom::TestWindowBoundsAddress()
 {
 	return g_windowBounds;
@@ -322,11 +463,16 @@ void RenderZoom::ResetFrameState()
 	g_viewRect = {};
 	g_viewRectValid = false;
 	g_lastViewPoll = 0;
+	TextDefer::Reset();
 }
 
 bool RenderZoom::PreRender()
 {
 	if (!g_enabled) return false;
+
+	// A frame never inherits text records: a PostRender that did not run
+	// must not feed a stale region into this frame's capture.
+	TextDefer::Reset();
 
 	// Advance the zoom lerp and the game camera before the frame is drawn,
 	// so the substituted view below matches the camera move of this very
@@ -358,6 +504,42 @@ bool RenderZoom::PreRender()
 	{
 		RestoreViewDims();
 		forceRedraw = true;
+	}
+
+	// Poll the vanilla view rect and feed the reactive watch. Runs whenever
+	// the view dimensions are currently vanilla — which includes the frames
+	// of a magnified session, because PostRender restored the pair at the
+	// end of the previous frame — and only skips a frame whose dimensions
+	// are still substituted (a PostRender that did not run), so the watch
+	// never sees our own scaling. Polling while magnified matters: the
+	// first zoom of a session can start before any native frame observed
+	// the rect (the game sits at a screen where view == window and the
+	// poll rejects it), and substituting against the raw client rect
+	// renders the wrong geometry while ClampCoordMap keeps the full-view
+	// bound — the invisible wall at the map corner.
+	if (!g_substituted)
+	{
+		RECT candidate = {};
+		int windowW = 0;
+		int windowH = 0;
+		if (ReadGameViewRect(candidate, &windowW, &windowH))
+		{
+			ScalerConflict::ObserveViewDims(windowW, windowH,
+				candidate.right - candidate.left, candidate.bottom - candidate.top,
+				now);
+			if (ScalerConflict::ReactiveConflict())
+			{
+				Disable("a world-space scaler is rescaling the view");
+				return false;
+			}
+
+			if (AcceptViewRect(candidate, now))
+			{
+				LOG("RenderZoom: view rect (%ld,%ld)-(%ld,%ld)",
+					candidate.left, candidate.top, candidate.right, candidate.bottom);
+				Zoomer::SetViewRect(candidate, true);
+			}
+		}
 	}
 
 	if (magnified)
@@ -395,42 +577,36 @@ bool RenderZoom::PreRender()
 						return forceRedraw;
 					}
 					g_substituted = true;
-					LOG("RenderZoom: view %dx%d -> source %dx%d",
-						savedW, savedH, src.W, src.H);
+					// Set_View_Dimensions keeps TacticalClass::view_bound in
+					// lockstep with the DSurface pair and re-runs
+					// CalcViewportCells; do the same or the engine renders the
+					// small rect at the full-view origin (cut off bottom /
+					// right). The camera was already clamped to the source
+					// size during TickFrame, so only the origin needs the
+					// recompute here.
+					WriteViewBoundCache(src.W, src.H);
+					int posX = 0, posY = 0;
+					const bool recalced = RecalcViewport(&posX, &posY);
+					// The origin doubles as the runtime proof the recalc
+					// really ran (recalc=false means the instance guard
+					// rejected the heap TacticalClass and the origin stayed
+					// full-view based).
+					LOG("RenderZoom: view %dx%d -> source %dx%d -> origin (%d,%d)%s",
+						savedW, savedH, src.W, src.H, posX, posY,
+						recalced ? "" : " [recalc SKIPPED]");
 				}
 				// The engine renders the small view; ask it to repaint all
-				// of it so no stale full view pixels leak in.
+				// of it so no stale full view pixels leak in. The text
+				// funnels arm for the draw pass that follows: anything
+				// anchored inside the region is captured and replayed
+				// after the stretch (TextDefer).
+				TextDefer::BeginFrame(view, src.W, src.H);
 				forceRedraw = true;
 			}
 		}
 	}
 	else
 	{
-		// Poll the vanilla view rect and feed the reactive watch. Only runs
-		// while nothing is substituted, so the watch never sees our own
-		// scaling.
-		RECT candidate = {};
-		int windowW = 0;
-		int windowH = 0;
-		if (ReadGameViewRect(candidate, &windowW, &windowH))
-		{
-			ScalerConflict::ObserveViewDims(windowW, windowH,
-				candidate.right - candidate.left, candidate.bottom - candidate.top,
-				now);
-			if (ScalerConflict::ReactiveConflict())
-			{
-				Disable("a world-space scaler is rescaling the view");
-				return false;
-			}
-
-			if (AcceptViewRect(candidate, now))
-			{
-				LOG("RenderZoom: view rect (%ld,%ld)-(%ld,%ld)",
-					candidate.left, candidate.top, candidate.right, candidate.bottom);
-				Zoomer::SetViewRect(candidate, true);
-			}
-		}
-
 		// The stretch of the previous magnified frames is still on screen:
 		// one full vanilla repaint clears it.
 		if (g_magnifiedLastFrame) forceRedraw = true;
@@ -485,12 +661,27 @@ void RenderZoom::PostRender()
 				UnlockSurface();
 			}
 		}
+
+		// The stretch sits on the surface. The vanilla view dimensions go
+		// back FIRST: the deferred HUD draws below re-invoke originals
+		// that recompute their layout from those dimensions — with the
+		// substituted pair still in place they would re-derive the small
+		// source rect and come out magnified again.
+		if (g_substituted)
+			RestoreViewDims();
+
+		// Re-invoke the deferred DrawTimer / DrawScreenText / DrawUI
+		// calls: they land at native size on top of the stretch — before
+		// the cursor blit and Present.
+		TextDefer::ReplayDeferred();
 	}
 
-	// The stretch ran (or was skipped): between frames the coordinate paths
-	// must see the vanilla view dimensions again.
+	// Safety net for a substituted frame that took a different path: the
+	// coordinate paths must see the vanilla view dimensions again between
+	// frames, and no record may outlive its frame.
 	if (g_substituted)
 		RestoreViewDims();
+	TextDefer::Reset();
 }
 
 RenderZoom::SourceRect RenderZoom::ComputeSourceRect(
@@ -611,12 +802,65 @@ bool RenderZoom::CachedViewRect(RECT& out)
 
 int RenderZoom::ClampWidth()
 {
+	++g_clampHookCallsW;
 	return ClampViewDimension(true);
 }
 
 int RenderZoom::ClampHeight()
 {
+	++g_clampHookCallsH;
 	return ClampViewDimension(false);
+}
+
+void RenderZoom::LogCameraClampState()
+{
+	// Captured before the Clamp* calls below bump them once more: a zero
+	// here means the syhks hook never ran in this process.
+	const unsigned long callsW = g_clampHookCallsW;
+	const unsigned long callsH = g_clampHookCallsH;
+
+	const int clampW = ClampWidth();
+	const int clampH = ClampHeight();
+	const float zoom = Zoomer::CurrentZoom();
+
+	RECT view = {};
+	const bool haveView = CachedViewRect(view);
+	int srcW = 0;
+	int srcH = 0;
+	if (haveView)
+	{
+		const int w = view.right - view.left;
+		const int h = view.bottom - view.top;
+		const POINT anchor = Zoomer::ZoomAnchor();
+		const SourceRect src = ComputeSourceRect(
+			w, h, anchor.x - view.left, anchor.y - view.top, zoom);
+		srcW = src.W;
+		srcH = src.H;
+	}
+
+	int map[5] = {};
+	for (int i = 0; i < 5; ++i)
+	{
+		const auto* p = reinterpret_cast<const void*>(g_mapAddrs[i]);
+		if (IsGameReadable(p, sizeof(int)))
+			map[i] = *reinterpret_cast<const int*>(p);
+	}
+
+	LOG("clamp state: zoom=%.3f hooks=%lu/%lu clampDim=(%d,%d) src=(%dx%d) viewCached=%d map=(%d,%d,%d,%d,%d)",
+		zoom, callsW, callsH, clampW, clampH, srcW, srcH,
+		haveView ? 1 : 0, map[0], map[1], map[2], map[3], map[4]);
+}
+
+int RenderZoom::SidebarViewWidth()
+{
+	// While the view is substituted the game global holds the smaller source
+	// rect; the sidebar blit must still position against the full view width.
+	if (g_substituted) return g_savedViewW;
+
+	int w = 0;
+	int h = 0;
+	if (!ReadViewDims(w, h)) return 0;
+	return w;
 }
 
 int RenderZoom::ClampDimension(int gameDim, int srcDim, bool magnified)

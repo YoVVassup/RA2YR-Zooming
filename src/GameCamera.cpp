@@ -45,6 +45,12 @@ namespace
 	// the test process, so tests supply the instance explicitly. Null is the
 	// "no instance" state, not a fallback to the game slot.
 	TacticalClass* g_tacticalInstance = nullptr;
+
+	// One-shot Read() failure: the next Read refuses once and clears the
+	// flag, so ApplyCameraStep's post-shift branch for an unreadable camera
+	// (normally unreachable: its own checks require the reads to succeed)
+	// can run under test.
+	bool g_failNextRead = false;
 #endif
 }
 
@@ -110,6 +116,11 @@ bool GameCamera::Read(POINT& out)
 	if (!g_enabled) return false;
 
 #ifdef VIEWCTRL_TEST
+	if (g_failNextRead)
+	{
+		g_failNextRead = false;
+		return false;
+	}
 	TacticalClass* tactical = g_tacticalInstance;
 #else
 	TacticalClass* tactical = TacticalClass::Instance;
@@ -164,6 +175,13 @@ bool GameCamera::ShiftBy(int dx, int dy)
 	return true;
 }
 
+bool GameCamera::Reclamp()
+{
+	POINT current = {};
+	if (!Read(current)) return false;
+	return WriteAbs(current);
+}
+
 #ifdef VIEWCTRL_TEST
 void GameCamera::EnableForTest()
 {
@@ -187,5 +205,10 @@ void GameCamera::SetCameraProbeAddressForTest(const void* address)
 	g_cameraProbeAddress = address
 		? address
 		: reinterpret_cast<const void*>(SET_CAMERA_POSITION);
+}
+
+void GameCamera::SetFailNextReadForTest(bool fail)
+{
+	g_failNextRead = fail;
 }
 #endif

@@ -33,14 +33,16 @@ Cheap, runs first. Defeated by a rename — hence the layers below.
 ### L2 — `.syhks00` hook-table fingerprint
 
 `ImageClaimsScalerShare` walks a foreign PE image's `.syhks00` section
-(Syringe's declarative hook table) and counts how many of ViewCtrl's eight
-*fingerprint* sites it claims. The fingerprint is all nine hook sites
+(Syringe's declarative hook table) and counts how many of ViewCtrl's sixteen
+*fingerprint* sites it claims. The fingerprint is all seventeen hook sites
 except `0x52CAE9`, which Ares legitimately shares with everyone.
 
 - `Present()` asks for **≥ 1** claim: a plugin that owns any non-Ares site
   of this pipeline re-implements the same zoom.
-- Offline / research threshold is **≥ 3**: Telescope claims all nine,
-  Kaleidoscope six; ordinary framework plugins share at most Ares's site.
+- Offline / research threshold is **≥ 3**: Telescope claims eight of the
+  fingerprint sites (its table is the historical nine, plus the shared
+  Ares site), Kaleidoscope six; ordinary framework plugins share at most
+  Ares's site.
 
 Hook declarations are `align(16)` records of
 `{hookAddr: u32, hookSize: u32, namePtr: u32, pad: u32}`.
@@ -104,8 +106,9 @@ module, once at GameInt.
 When any layer fires — at GameInt or later from PreRender — the module is
 disabled for the rest of the session:
 
-1. `RenderZoom::Disable(reason)` — restores substituted view bounds if any,
-   drops the scratch buffer, logs the reason, clears `g_enabled`.
+1. The internal `Disable(reason)` helper in `RenderZoom.cpp` — restores
+   substituted view bounds if any, drops the scratch buffer
+   (`ResetFrameState`), logs the reason, clears `g_enabled`.
 2. `Zoomer::Shutdown()` — restores the window procedure, disables the game
    camera hook, joins the init thread.
 3. Every hook continues to replay the original instructions.
@@ -118,7 +121,7 @@ reliably, and flapping between modes would be worse than staying off.
 ## What is *not* a conflict
 
 - **Ares / Phobos / Kratos** — share `0x52CAE9` or nearby DrawOnTop sites,
-  claim none of the eight fingerprint sites, export no zoom API.
+  claim none of the sixteen fingerprint sites, export no zoom API.
 - **cnc-ddraw / DDrawCompat / ts-ddraw** — display-layer scalers; they
   change the window size, which L4 re-baselines. Vampire.Zoom is in the L1
   list because its zoom is intentional and compositional, not because the
@@ -130,13 +133,13 @@ reliably, and flapping between modes would be worse than staying off.
 
 ## Test coverage
 
-`tests/test_zoomer.cpp` covers (69 cases / 653 assertions, **99.7 %** of
-`src/` under OpenCppCoverage; only three defensive OS-failure branches
-remain unexercised):
+`tests/test_zoomer.cpp` covers (89 cases / 955 assertions, **100 %** of
+`src/` — 1495 of 1495 lines under OpenCppCoverage 0.9.9, including the
+production-only branches via test seams):
 
 - L1 name matching (positive and negative cases, case-insensitivity).
 - L2 `ImageClaimsScalerShare` against synthetic `.syhks00` images and the
-  real nine-site table of this plugin, including the `wrongSection` /
+  real seventeen-site table of this plugin, including the `wrongSection` /
   `noSection` / bad-header edge cases.
 - L3 `DecodeJumpTarget` (JMP / non-JMP / bounds), `SiteHookedForeign`
   with a fake foreign module, and the full `RuntimePatchPresent` /
@@ -153,10 +156,17 @@ Test-only seams (`VIEWCTRL_TEST`) used to reach defensive branches:
 
 | Seam | Purpose |
 |------|---------|
-| `GameCamera::SetCameraProbeAddressForTest` | point `Enable()` at a controllable prologue |
-| `Debug::SetLogEnabledForTest` / `LogForceDisabled` | force the log on/off regardless of env |
-| `ScalerConflict::SetFailOwnImageForTest` | make `OwnImage()` return null |
+| `GameCamera::EnableForTest` / `SetTacticalInstanceForTest` / `SetCameraPositionForTest` | arm the camera wrapper at a fake tactical instance and a stubbed `SetCameraPosition` |
+| `GameCamera::SetCameraProbeAddressForTest` | point `Enable()` at a controllable prologue (success and refusal paths) |
+| `GameCamera::SetFailNextReadForTest` | one-shot camera read failure — reaches `ApplyCameraStep`'s unverifiable-shift fallback |
+| `RenderZoom::SetEnabled` / `SetTestGameRegion` / `SetViewBoundForTest` | drive the frame hooks against a fake game region instead of gamemd.exe |
+| `RenderZoom::SetMapBoundsForTest` | feed `LogCameraClampState` readable map cell-extent globals |
 | `RenderZoom::SetLastPatchScanForTest` | force the L3 patch scan on the next frame |
+| `ScalerConflict::SetFailOwnImageForTest` / `SetFailEnumModulesForTest` | make `GetModuleHandleEx` / `EnumProcessModules` fail (OS-failure paths) |
+| `TextDefer::SetForceGameCodeForTest` + `SetGameEntryPointsForTest` | open the replay gate and redirect the DrawTimer / DrawScreenText dispatch at stub targets |
+| `TextDefer::SetReplayProbeForTest` / `SetReplayingForTest` | intercept the replay per record / force the hooks to pass through |
+| `Debug::SetLogEnabledForTest` / `LogForceDisabled` | force the log on/off regardless of env |
+| `SetFlagByteForTest` (Main.cpp) | sidebar flag byte the PostRender hook reads |
 
 The SEH guards around the hook bodies (`src/Seh.h`) are compiled out under
 `VIEWCTRL_TEST` so a deliberate edge case in the tests crashes the test
